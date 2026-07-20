@@ -75,3 +75,8 @@ dist_windows_amd/
 .repowise-workspace.yaml
 .mcp.json
 AGENTS.md
+
+# ffplay-fsr1 local build / tooling artifacts (not part of jasna source)
+/dist2/
+/jasna_sidecar.log
+/jasna_sidecar.spec
