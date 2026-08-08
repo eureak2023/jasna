@@ -43,7 +43,7 @@ nvidia = [
   # DecodeSingleSurfaceAsyncDetailed); with the stock PyPI wheel the reader
   # falls back to PyAV at open time. Release builds install the fork wheel from
   # keytool/wheels/ on top of this pin (see keytool/build_linux.sh).
-  "python_vali==4.8.7",
+  "python_vali==4.8.8",
 ]
 amd = [
   "torch==2.9.1",
