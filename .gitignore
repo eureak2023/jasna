@@ -77,8 +77,10 @@ dist_windows_amd/
 AGENTS.md
 assets/benchmark/
 
-# ffplay-fsr1 local build / tooling artifacts (not part of jasna source)
+# ffplay-fsr1 local build / tooling artifacts (not part of jasna source).
+# jasna_sidecar.spec is NOT ignored: it carries build logic that is not reproducible from
+# scratch (which CUDA kernels land at the bundle root, the ffmpeg 8 tools/ payload), and
+# losing it shows up only as a puzzling runtime failure.
 /dist2/
 /build2/
 /jasna_sidecar.log
-/jasna_sidecar.spec
