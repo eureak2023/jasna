@@ -212,7 +212,23 @@ class RawFrameWriter:
         pass
 
 
-def build_pipeline(device_str, model_weights, max_clip_size, batch_size, temporal_overlap, fp16):
+def resolve_detection_model(mw, requested):
+    """Pick the detection model to run: the requested one if its weights are there, else the
+    first of our preference order that is. Returns a name whose .onnx exists, or the requested
+    name unchanged so the caller fails with jasna's own clear "missing weights" error."""
+    order = ["rfdetr-v6", "rfdetr-v6-large", "rfdetr-v5"]
+    if requested:
+        if (mw / f"{requested}.onnx").is_file():
+            return requested
+        log(f"detector {requested} weights not in {mw}, falling back")
+    for name in order:
+        if (mw / f"{name}.onnx").is_file():
+            return name
+    return requested or order[0]
+
+
+def build_pipeline(device_str, model_weights, max_clip_size, batch_size, temporal_overlap, fp16,
+                   detection_model=""):
     from jasna.accelerator import device_context
     from jasna.engine_compiler import EngineCompilationRequest, ensure_engines_compiled
     from jasna.restorer.basicvsrpp_mosaic_restorer import BasicvsrppMosaicRestorer
@@ -222,8 +238,18 @@ def build_pipeline(device_str, model_weights, max_clip_size, batch_size, tempora
 
     device = torch.device(device_str)
     mw = Path(model_weights)
-    detection_model_name = "rfdetr-v5"
-    detection_model_path = mw / "rfdetr-v5.onnx"
+    # Detector: prefer whatever --detection-model asks for, else the newest weights actually
+    # present. jasna's own default (rfdetr-v6, 576px) detects faster than v5 (768px), which is
+    # what we want when restoration has to keep up with playback - but plain v6 ships only
+    # inside the official release binaries, so a source build may not have it. Fall back down
+    # the list instead of dying on a missing file.
+    detection_model_name = resolve_detection_model(mw, detection_model)
+    detection_model_path = mw / f"{detection_model_name}.onnx"
+    # Each model carries its own tuned score threshold (v5 0.25, v6 0.35, v6-large 0.40);
+    # hardcoding one would silently mis-tune the others.
+    from jasna.mosaic.detection_registry import rfdetr_model_config
+    detection_score_threshold = rfdetr_model_config(detection_model_name).score_threshold
+    log(f"detector {detection_model_name} (threshold {detection_score_threshold})")
     restoration_model_path = mw / "lada_mosaic_restoration_model_generic_v1.2.pth"
 
     log("compiling/loading engines (reuses cached engines in model_weights) ...")
@@ -245,7 +271,8 @@ def build_pipeline(device_str, model_weights, max_clip_size, batch_size, tempora
         pipeline = Pipeline(
             input_video=Path("__none__"), output_video=Path("__none___out"),
             detection_model_name=detection_model_name, detection_model_path=detection_model_path,
-            detection_score_threshold=0.25, restoration_pipeline=restoration_pipeline,
+            detection_score_threshold=detection_score_threshold,
+            restoration_pipeline=restoration_pipeline,
             codec="h264", encoder_settings={}, batch_size=batch_size, device=device,
             max_clip_size=max_clip_size, temporal_overlap=temporal_overlap, enable_crossfade=True,
             # jasna's own CLI defaults for the detection-tracking knobs. scene_detection is
@@ -341,9 +368,11 @@ def run_pass(pipeline, device, metadata, gen, seek_ts, cancel_event):
 
 
 class Sidecar:
-    def __init__(self, model_weights, device, max_clip_size, batch_size, temporal_overlap, fp16):
+    def __init__(self, model_weights, device, max_clip_size, batch_size, temporal_overlap, fp16,
+                 detection_model=""):
         self.pipeline, self.device = build_pipeline(
-            device, model_weights, max_clip_size, batch_size, temporal_overlap, fp16)
+            device, model_weights, max_clip_size, batch_size, temporal_overlap, fp16,
+            detection_model)
         self._path = None
         self._meta = None
         self._cancel = None
@@ -434,6 +463,9 @@ def run_sidecar():
         os.environ["JASNA_DECODE_BACKEND"] = {"hw": "pyav-hw", "sw": "pyav-sw"}.get(_sel, _sel)
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-weights", required=True, help="dir with the jasna model weights + engines")
+    ap.add_argument("--detection-model", default="",
+                    help="rfdetr-v6 | rfdetr-v6-large | rfdetr-v5 "
+                         "(default: the newest whose weights are in --model-weights)")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--max-clip-size", type=int, default=90)
     ap.add_argument("--batch-size", type=int, default=4)
@@ -448,7 +480,8 @@ def run_sidecar():
             _logf = None
     try:
         sc = Sidecar(args.model_weights, args.device, args.max_clip_size,
-                     args.batch_size, args.temporal_overlap, not args.no_fp16)
+                     args.batch_size, args.temporal_overlap, not args.no_fp16,
+                     args.detection_model)
         sc.run()
     except Exception:
         log("FATAL:\n" + traceback.format_exc())
