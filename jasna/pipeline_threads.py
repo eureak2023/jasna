@@ -19,6 +19,7 @@ from jasna.pipeline_timing import LoopTimer
 from jasna.progressbar import Progressbar
 from jasna.restorer import RestorationPipeline
 from jasna.tracking import ClipTracker
+from jasna.tracking.scene_detector import SceneCutDetector
 
 log = logging.getLogger(__name__)
 
@@ -37,7 +38,10 @@ def decode_detect_loop(
     detection_model,
     max_clip_size: int,
     temporal_overlap: int,
+    max_detection_gap: int,
+    min_detection_duration: int,
     enable_crossfade: bool,
+    scene_detection: bool,
     blend_buffer: BlendBuffer,
     crop_buffers: dict[int, CropBuffer],
     clip_queue: FrameQueue,
@@ -60,7 +64,12 @@ def decode_detect_loop(
     timer = LoopTimer("decode-detect")
     try:
         torch.cuda.set_device(device)
-        tracker = ClipTracker(max_clip_size=max_clip_size, temporal_overlap=temporal_overlap)
+        tracker = ClipTracker(
+            max_clip_size=max_clip_size,
+            temporal_overlap=temporal_overlap,
+            max_detection_gap=max_detection_gap,
+        )
+        scene_detector = SceneCutDetector() if scene_detection else None
         discard_margin = temporal_overlap
         blend_frames = (temporal_overlap // 3) if enable_crossfade else 0
 
@@ -78,9 +87,7 @@ def decode_detect_loop(
                 progress.init()
             target_hw = (int(metadata.video_height), int(metadata.video_width))
             crop_eye_width = (
-                int(metadata.video_width) // 2
-                if vr_mode in {"sbs", "sbs-fisheye"}
-                else None
+                int(metadata.video_width) // 2 if vr_mode == "sbs" else None
             )
             frame_idx = 0 if seek_ts is None else _estimate_start_frame(metadata, seek_ts)
             effect_active = effect_ranges is None
@@ -104,7 +111,10 @@ def decode_detect_loop(
                     frame_shape=fs,
                     discard_margin=discard_margin,
                     blend_frames=blend_frames,
+                    min_detection_duration=min_detection_duration,
                 )
+                if scene_detector is not None:
+                    scene_detector.reset()
                 effect_active = False
             log.info(
                 "Processing %s: %d frames @ %s fps, %dx%d",
@@ -157,15 +167,10 @@ def decode_detect_loop(
                             if selected:
                                 effect_active = True
                                 selected_frames = frames[offset:group_end]
-                                if vr_projector is not None:
-                                    selected_frames = vr_projector.forward_sbs(
-                                        selected_frames
-                                    )
                                 res = process_frame_batch(
                                     frames=selected_frames,
                                     pts_list=[int(p) for p in pts_list[offset:group_end]],
                                     start_frame_idx=frame_idx,
-                                    batch_size=batch_size,
                                     target_hw=target_hw,
                                     detections_fn=detection_model,
                                     tracker=tracker,
@@ -176,6 +181,9 @@ def decode_detect_loop(
                                     discard_margin=discard_margin,
                                     blend_frames=blend_frames,
                                     crop_eye_width=crop_eye_width,
+                                    min_detection_duration=min_detection_duration,
+                                    scene_detector=scene_detector,
+                                    vr_projector=vr_projector,
                                 )
                                 frame_idx = res.next_frame_idx
                             else:
@@ -348,7 +356,6 @@ def blend_encode_loop(
     seek_ts: float | None = None,
     frame_stride: int = 1,
     vram_offloader=None,
-    vr_projector=None,
 ) -> None:
     timer = LoopTimer("blend-encode")
     try:
@@ -418,20 +425,6 @@ def blend_encode_loop(
                 with timer.measure("blend"):
                     if not meta.apply_effect:
                         blended = original_frame
-                    elif (
-                        vr_projector is not None
-                        and blend_buffer.has_pending(meta.frame_idx)
-                    ):
-                        projected_source = vr_projector.forward_sbs(original_frame)
-                        blended_fisheye = blend_buffer.blend_frame(
-                            meta.frame_idx,
-                            projected_source,
-                        )
-                        blended = vr_projector.restore_delta_to_source(
-                            original_frame,
-                            projected_source,
-                            blended_fisheye,
-                        )
                     else:
                         blended = blend_buffer.blend_frame(
                             meta.frame_idx,

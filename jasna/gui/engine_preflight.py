@@ -42,7 +42,12 @@ def run_engine_preflight(settings: AppSettings) -> EnginePreflightResult:
         get_yolo_tensorrt_engine_path,
         model_weights_dir,
     )
-    from jasna.mosaic.detection_registry import is_rfdetr_model, is_yolo_model, coerce_detection_model_name
+    from jasna.mosaic.detection_registry import (
+        coerce_detection_model_name,
+        is_rfdetr_model,
+        is_yolo_model,
+        rfdetr_model_config,
+    )
 
     reqs: list[EngineRequirement] = []
     device = torch.device("cuda:0")
@@ -52,33 +57,17 @@ def run_engine_preflight(settings: AppSettings) -> EnginePreflightResult:
     det_weights = _detection_weights_path(settings)
     if is_rfdetr_model(det_name):
         if amd:
-            from jasna.mosaic.migraphx_runner import (
-                migraphx_cache_dir,
-                migraphx_cache_is_ready,
-                migraphx_provider_available,
-            )
-
-            if migraphx_provider_available():
-                det_engine = migraphx_cache_dir(
-                    det_weights,
-                    device,
-                    fp16=bool(settings.fp16_mode),
-                )
-                det_exists = migraphx_cache_is_ready(
-                    det_weights,
-                    device,
-                    fp16=bool(settings.fp16_mode),
-                )
-            else:
-                # Standard ONNX Runtime on Windows executes RF-DETR on CPU and
-                # does not create a precompiled engine/cache artifact.
-                det_engine = None
-                det_exists = True
+            # AMD runs RF-DETR through the rfdetr torch model; no precompiled
+            # engine/cache artifact to check or build.
+            det_engine = None
+            det_exists = True
         else:
+            config = rfdetr_model_config(det_name)
             det_engine = get_onnx_tensorrt_engine_path(
                 det_weights,
-                batch_size=int(settings.batch_size),
+                batch_size=config.engine_batch_size(settings.batch_size),
                 fp16=bool(settings.fp16_mode),
+                dynamic_batch=config.dynamic_batch,
             )
             det_exists = det_engine.is_file()
         if det_engine is not None:
@@ -106,7 +95,7 @@ def run_engine_preflight(settings: AppSettings) -> EnginePreflightResult:
 
     restoration_model_path = model_weights_dir() / "lada_mosaic_restoration_model_generic_v1.2.pth"
     if bool(settings.compile_basicvsrpp) and not amd:
-        sub_paths = get_basicvsrpp_sub_engine_paths(str(restoration_model_path), bool(settings.fp16_mode), int(settings.max_clip_size))
+        sub_paths = get_basicvsrpp_sub_engine_paths(str(restoration_model_path), bool(settings.fp16_mode))
         all_engine_paths = tuple(Path(p) for p in sub_paths.values())
         missing_paths = tuple(p for p in all_engine_paths if not p.is_file())
         reqs.append(

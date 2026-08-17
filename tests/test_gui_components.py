@@ -1,10 +1,19 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from jasna.gui.components import JobListItem
+import customtkinter as ctk
+import pytest
+from tkinter import TclError
+
+from jasna.gui import app as app_module
+from jasna.gui import components
+from jasna.gui.app import JasnaApp
+from jasna.gui.components import JobListItem, StatusPill
 from jasna.gui.control_bar import ControlBar
 from jasna.gui.locales import t
+from jasna.gui.locales.th import TH
 
 
 def test_segment_tooltips_hide_before_editor_opens() -> None:
@@ -18,6 +27,111 @@ def test_segment_tooltips_hide_before_editor_opens() -> None:
     for tooltip in item._segment_tooltips:
         tooltip.hide.assert_called_once_with()
     item._on_edit_segments.assert_called_once_with()
+
+
+def test_queue_overflow_menu_uses_button_and_right_click_coordinates(monkeypatch) -> None:
+    menus = []
+
+    class Menu:
+        def __init__(self, *_args, **_kwargs):
+            self.commands = []
+            self.popup = None
+            self.released = False
+            self.destroyed = False
+            menus.append(self)
+
+        def add_command(self, **kwargs):
+            self.commands.append(kwargs)
+
+        def add_separator(self):
+            self.commands.append(None)
+
+        def bind(self, *_args):
+            pass
+
+        def delete(self, *_args):
+            self.commands.clear()
+
+        def tk_popup(self, x, y):
+            self.popup = (x, y)
+
+
+    monkeypatch.setattr(components.tkinter, "Menu", Menu)
+    monkeypatch.setattr(components, "t", lambda key: key)
+    handler = MagicMock()
+    item = SimpleNamespace(
+        _overflow_btn=SimpleNamespace(
+            winfo_rootx=lambda: 10,
+            winfo_rooty=lambda: 20,
+            winfo_height=lambda: 22,
+        ),
+        _handle_open_containing_folder=handler,
+        _handle_copy_path=MagicMock(),
+        _has_restored_output=False,
+        _requeueable=False,
+    )
+
+    assert JobListItem._show_action_menu(item) == "break"
+    assert menus[0].popup == (10, 42)
+    assert menus[0].commands[0]["label"] == "open_containing_folder"
+
+    assert JobListItem._show_action_menu(item, SimpleNamespace(x_root=30, y_root=40)) == "break"
+    assert menus[0].popup == (30, 40)
+
+
+def test_queue_overflow_menu_includes_completed_actions(monkeypatch) -> None:
+    menus = []
+
+    class Menu:
+        def __init__(self, *_args, **_kwargs):
+            self.commands = []
+            menus.append(self)
+
+        def add_command(self, **kwargs):
+            self.commands.append(kwargs)
+
+        def add_separator(self):
+            self.commands.append(None)
+
+        def bind(self, *_args):
+            pass
+
+        def delete(self, *_args):
+            self.commands.clear()
+
+        def tk_popup(self, *_args):
+            pass
+
+    monkeypatch.setattr(components.tkinter, "Menu", Menu)
+    monkeypatch.setattr(components, "t", lambda key: key)
+    item = SimpleNamespace(
+        _overflow_btn=SimpleNamespace(
+            winfo_rootx=lambda: 10,
+            winfo_rooty=lambda: 20,
+            winfo_height=lambda: 22,
+        ),
+        _handle_open_containing_folder=MagicMock(),
+        _handle_copy_path=MagicMock(),
+        _handle_open_restored_output=MagicMock(),
+        _handle_requeue=MagicMock(),
+        _has_restored_output=True,
+        _requeueable=True,
+    )
+
+    JobListItem._show_action_menu(item)
+
+    assert [entry["label"] for entry in menus[0].commands if entry] == [
+        "open_containing_folder",
+        "copy_path",
+        "open_restored_output",
+        "requeue",
+    ]
+
+
+def test_queue_overflow_menu_is_suppressed_when_hidden() -> None:
+    item = SimpleNamespace(_action_menu_visible=False)
+
+    assert JobListItem._show_action_menu(item) == "break"
 
 
 def test_enabling_start_button_hides_disabled_tooltip() -> None:
@@ -62,3 +176,70 @@ def test_completed_job_combines_status_and_elapsed_time() -> None:
     )
     item._fps_label.configure.assert_called_once_with(text="")
     item._eta_label.configure.assert_called_once_with(text="")
+
+
+def test_status_pill_sizes_to_localized_content(monkeypatch) -> None:
+    translations = {
+        "status_idle": "พร้อม",
+        "status_processing": "กำลังประมวลผล",
+        "status_paused": "หยุดชั่วคราว",
+        "status_completed": "เสร็จสิ้น",
+        "status_error": "ข้อผิดพลาด",
+    }
+    monkeypatch.setattr(components, "t", translations.__getitem__)
+    try:
+        root = ctk.CTk()
+    except TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+
+    try:
+        pill = StatusPill(root)
+        pill.pack()
+        widths = []
+        for status in ("IDLE", "PROCESSING", "PAUSED", "COMPLETED", "ERROR"):
+            pill.set_status(status, "#ffffff")
+            root.update_idletasks()
+            widths.append(pill.winfo_reqwidth())
+
+        assert max(widths) < 180
+        assert pill._label.cget("text") == translations["status_error"].upper()
+    finally:
+        root.destroy()
+
+
+def test_header_keeps_about_button_visible_at_default_width(monkeypatch) -> None:
+    monkeypatch.setattr(app_module, "t", TH.__getitem__)
+    monkeypatch.setattr(components, "t", TH.__getitem__)
+    try:
+        root = ctk.CTk()
+    except TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+
+    for name in (
+        "_open_video_player",
+        "_show_system_check",
+        "_show_help",
+        "_show_about",
+        "_open_license_dialog",
+        "_refresh_license_chip",
+        "_on_language_changed",
+    ):
+        setattr(root, name, lambda *_args: None)
+
+    try:
+        root.geometry("1320x100")
+        JasnaApp._build_header(root)
+        root._status_pill.set_status("PROCESSING", "#ffffff")
+        root.update()
+
+        window_right = root.winfo_rootx() + root.winfo_width()
+        about_right = root._about_btn.winfo_rootx() + root._about_btn.winfo_width()
+        status_right = (
+            root._status_pill.winfo_rootx() + root._status_pill.winfo_width()
+        )
+        header_right_left = root._lang_dropdown.master.winfo_rootx()
+        assert root._about_btn.winfo_width() > 1
+        assert about_right <= window_right
+        assert status_right < header_right_left
+    finally:
+        root.destroy()

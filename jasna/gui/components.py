@@ -4,6 +4,7 @@ import logging
 import tkinter
 import customtkinter as ctk
 import webbrowser
+from jasna.gui import scaling
 from jasna.gui.theme import Colors, Fonts, Sizing
 from jasna.gui.locales import t
 
@@ -231,11 +232,13 @@ class LicenseDialog(ctk.CTkToplevel):
                 self._status.configure(text=t("license_active"), text_color=Colors.STATUS_COMPLETED)
 
         self.update_idletasks()
-        w = max(388, self.winfo_reqwidth())
-        h = self.winfo_reqheight()
-        x = master.winfo_x() + (master.winfo_width() - w) // 2
-        y = master.winfo_y() + (master.winfo_height() - h) // 2
-        self.geometry(f"{w}x{h}+{x}+{y}")
+        minimum_width, _ = scaling.to_physical(self, 388, 0)
+        scaling.place_centered_on_parent(
+            self,
+            master,
+            max(minimum_width, self.winfo_reqwidth()),
+            self.winfo_reqheight(),
+        )
 
     def _activate(self):
         from jasna.protection import ProtectionError, license_store
@@ -258,10 +261,12 @@ class StatusPill(ctk.CTkFrame):
             master,
             fg_color=Colors.BG_CARD,
             corner_radius=16,
+            width=1,
             height=28,
             **kwargs
         )
-        self.grid_propagate(False)
+        self.grid_propagate(True)
+        self._status_key = "idle"
         
         self._indicator = ctk.CTkLabel(
             self,
@@ -271,19 +276,51 @@ class StatusPill(ctk.CTkFrame):
             fg_color=Colors.STATUS_PENDING,
             corner_radius=4,
         )
-        self._indicator.grid(row=0, column=0, padx=(12, 6), pady=8)
+        self._indicator.grid(row=0, column=0, padx=(10, 5), pady=8)
         
         self._label = ctk.CTkLabel(
             self,
-            text=t("status_idle"),
+            text=t(f"status_{self._status_key}"),
             font=(Fonts.FAMILY, Fonts.SIZE_SMALL, "bold"),
             text_color=Colors.TEXT_PRIMARY,
+            height=20,
         )
-        self._label.grid(row=0, column=1, padx=(0, 12), pady=4)
+        self._label.grid(row=0, column=1, padx=(0, 10), pady=4)
         
     def set_status(self, status: str, color: str):
-        self._label.configure(text=status.upper())
+        self._status_key = status.lower()
+        self.refresh_text()
         self._indicator.configure(fg_color=color)
+
+    def refresh_text(self) -> None:
+        self._label.configure(text=t(f"status_{self._status_key}").upper())
+
+
+class AutoHidingScrollableFrame(ctk.CTkScrollableFrame):
+    """Scrollable frame whose scrollbar is gridded only while the content overflows."""
+
+    def __init__(self, master, **kwargs):
+        super().__init__(master, **kwargs)
+        self._scrollbar_visible = True
+        # The scrollbar's default 200px height request joins the panel's size
+        # negotiation, so under height shortage gridding it in/out re-splits the
+        # space and flips the overflow state back — an endless <Configure> storm
+        # that froze the GUI at 200% display scaling (#253). A token request
+        # keeps show/hide geometry-neutral vertically; sticky="ns" sizes it.
+        self._scrollbar.configure(height=8)
+        self._parent_canvas.configure(yscrollcommand=self._update_scrollbar)
+        self.after_idle(lambda: self._update_scrollbar(*self._parent_canvas.yview()))
+
+    def _update_scrollbar(self, first: str | float, last: str | float) -> None:
+        self._scrollbar.set(first, last)
+        should_show = float(first) > 0.0 or float(last) < 1.0
+        if should_show == self._scrollbar_visible:
+            return
+        if should_show:
+            self._scrollbar.grid()
+        else:
+            self._scrollbar.grid_remove()
+        self._scrollbar_visible = should_show
 
 
 class CollapsibleSection(ctk.CTkFrame):
@@ -392,6 +429,11 @@ class JobListItem(ctk.CTkFrame):
         on_drag_move: callable = None,
         on_drag_end: callable = None,
         on_edit_segments: callable = None,
+        on_play: callable = None,
+        on_open_containing_folder: callable = None,
+        on_copy_path: callable = None,
+        on_open_restored_output: callable = None,
+        on_requeue: callable = None,
         **kwargs
     ):
         super().__init__(
@@ -405,6 +447,11 @@ class JobListItem(ctk.CTkFrame):
         
         self._on_remove = on_remove
         self._on_edit_segments = on_edit_segments
+        self._on_play = on_play
+        self._on_open_containing_folder = on_open_containing_folder
+        self._on_copy_path = on_copy_path
+        self._on_open_restored_output = on_open_restored_output
+        self._on_requeue = on_requeue
         # Drag callbacks (set by QueuePanel)
         self._on_drag_start = on_drag_start
         self._on_drag_move = on_drag_move
@@ -412,6 +459,10 @@ class JobListItem(ctk.CTkFrame):
         self._progress_visible = False
         self._conflict_visible = False
         self._segments_editable = True
+        self._player_enabled = True
+        self._action_menu_visible = True
+        self._has_restored_output = False
+        self._requeueable = False
         self._segment_tooltips: list[Tooltip] = []
         
         # Main content container
@@ -524,6 +575,34 @@ class JobListItem(ctk.CTkFrame):
                 Tooltip(self._segment_summary, t("segments_edit_tooltip")),
             ]
 
+        self._play_btn = ctk.CTkButton(
+            bottom_row,
+            text="▶",
+            width=30,
+            height=22,
+            fg_color=Colors.BG_PANEL,
+            hover_color=Colors.BORDER_LIGHT,
+            text_color=Colors.TEXT_PRIMARY,
+            cursor="hand2",
+            command=self._handle_play,
+        )
+        if self._on_play:
+            self._play_btn.pack(side="right", padx=(0, 6))
+            Tooltip(self._play_btn, t("queue_play_tooltip"))
+
+        self._overflow_btn = ctk.CTkButton(
+            bottom_row,
+            text="⋯",
+            width=24,
+            height=22,
+            fg_color=Colors.BG_PANEL,
+            hover_color=Colors.BORDER_LIGHT,
+            text_color=Colors.TEXT_PRIMARY,
+            cursor="hand2",
+            command=self._show_action_menu,
+        )
+        self._overflow_btn.pack(side="right")
+
         self._fps_label = ctk.CTkLabel(
             self._stats_frame,
             text="",
@@ -574,19 +653,24 @@ class JobListItem(ctk.CTkFrame):
         self._hide_after_id = None
 
         child_widgets = [
-            self._handle, self._info, self._filename, self._duration,
-            self._status_frame, self._status_label, self._top_row, self._bottom_row,
-            self._segment_summary, self._segments_btn,
+            content, self._handle, self._info, self._filename, self._duration,
+            self._conflict_dot, self._status_frame, self._status_icon,
+            self._status_label, self._stats_frame, self._fps_label, self._eta_label,
+            self._top_row, self._bottom_row, self._segment_summary, self._segments_btn,
+            self._play_btn, self._overflow_btn, self._progress,
         ]
         for child in child_widgets:
             try:
                 child.bind("<Enter>", self._on_enter)
                 child.bind("<Leave>", self._on_leave)
+                child.bind("<Button-3>", self._show_action_menu)
             except Exception:
                 logger.debug("Failed to bind hover events on child widget", exc_info=True)
         # Ensure remove button keeps the enter binding so moving onto it still shows
         self._remove_btn.bind("<Enter>", self._on_enter)
         self._remove_btn.bind("<Leave>", self._on_leave)
+        self._remove_btn.bind("<Button-3>", self._show_action_menu)
+        self.bind("<Button-3>", self._show_action_menu)
         
     def _on_enter(self, event=None):
         # Only show remove button if the pointer is actually inside this widget
@@ -653,6 +737,57 @@ class JobListItem(ctk.CTkFrame):
                 tooltip.hide()
             self._on_edit_segments()
 
+    def _handle_play(self) -> None:
+        if self._on_play and self._player_enabled:
+            self._on_play()
+
+    def _handle_open_containing_folder(self) -> None:
+        if self._on_open_containing_folder:
+            self._on_open_containing_folder()
+
+    def _handle_copy_path(self) -> None:
+        if self._on_copy_path:
+            self._on_copy_path()
+
+    def _handle_open_restored_output(self) -> None:
+        if self._on_open_restored_output:
+            self._on_open_restored_output()
+
+    def _handle_requeue(self) -> None:
+        if self._on_requeue:
+            self._on_requeue()
+
+    def _show_action_menu(self, event=None):
+        if not getattr(self, "_action_menu_visible", True):
+            return "break"
+        menu = getattr(self, "_action_menu", None)
+        if menu is None:
+            menu = tkinter.Menu(self, tearoff=False)
+            menu.bind("<Unmap>", lambda _event: menu.grab_release())
+            self._action_menu = menu
+        else:
+            menu.delete(0, "end")
+        menu.add_command(
+            label=t("open_containing_folder"),
+            command=self._handle_open_containing_folder,
+        )
+        menu.add_command(label=t("copy_path"), command=self._handle_copy_path)
+        if self._has_restored_output:
+            menu.add_command(
+                label=t("open_restored_output"),
+                command=self._handle_open_restored_output,
+            )
+        if self._requeueable:
+            menu.add_separator()
+            menu.add_command(label=t("requeue"), command=self._handle_requeue)
+        if event is None:
+            x = self._overflow_btn.winfo_rootx()
+            y = self._overflow_btn.winfo_rooty() + self._overflow_btn.winfo_height()
+        else:
+            x, y = event.x_root, event.y_root
+        menu.tk_popup(x, y)
+        return "break"
+
     def set_segment_summary(self, text: str, *, selected: bool = False) -> None:
         self._segment_summary.configure(
             text=text,
@@ -671,6 +806,33 @@ class JobListItem(ctk.CTkFrame):
                     tooltip.hide()
                 self._segments_btn.pack_forget()
             self._segment_summary.configure(cursor="hand2" if editable else "arrow")
+
+    def set_player_enabled(self, enabled: bool) -> None:
+        if self._on_play:
+            self._player_enabled = bool(enabled)
+            if enabled:
+                self._play_btn.configure(state="normal")
+                if not self._play_btn.winfo_manager():
+                    pack_options = {"side": "right", "padx": (0, 6)}
+                    if self._overflow_btn.winfo_manager():
+                        pack_options["before"] = self._overflow_btn
+                    self._play_btn.pack(**pack_options)
+            else:
+                self._play_btn.pack_forget()
+
+    def set_action_menu_visible(self, visible: bool) -> None:
+        self._action_menu_visible = bool(visible)
+        if visible:
+            if not self._overflow_btn.winfo_manager():
+                self._overflow_btn.pack(side="right")
+        else:
+            self._overflow_btn.pack_forget()
+
+    def set_action_options(
+        self, *, has_restored_output: bool, requeueable: bool
+    ) -> None:
+        self._has_restored_output = bool(has_restored_output)
+        self._requeueable = bool(requeueable)
 
     # Internal drag event proxies to allow QueuePanel to handle reordering
     def _internal_drag_start(self, event):
@@ -899,16 +1061,8 @@ class PresetDialog(ctk.CTkToplevel):
         self._existing_names = [n.lower() for n in existing_names]
         self._result = None
         
-        # Center on parent
-        self.geometry("320x180")
         self.update_idletasks()
-        parent_x = master.winfo_rootx()
-        parent_y = master.winfo_rooty()
-        parent_w = master.winfo_width()
-        parent_h = master.winfo_height()
-        x = parent_x + (parent_w - 320) // 2
-        y = parent_y + (parent_h - 180) // 2
-        self.geometry(f"+{x}+{y}")
+        scaling.place_centered_on_parent(self, master, *scaling.to_physical(self, 320, 180))
         
         # Content
         content = ctk.CTkFrame(self, fg_color="transparent")
@@ -998,15 +1152,8 @@ class ConfirmDialog(ctk.CTkToplevel):
         
         self._on_confirm = on_confirm
         
-        self.geometry("320x140")
         self.update_idletasks()
-        parent_x = master.winfo_rootx()
-        parent_y = master.winfo_rooty()
-        parent_w = master.winfo_width()
-        parent_h = master.winfo_height()
-        x = parent_x + (parent_w - 320) // 2
-        y = parent_y + (parent_h - 140) // 2
-        self.geometry(f"+{x}+{y}")
+        scaling.place_centered_on_parent(self, master, *scaling.to_physical(self, 320, 140))
         
         content = ctk.CTkFrame(self, fg_color="transparent")
         content.pack(fill="both", expand=True, padx=20, pady=20)

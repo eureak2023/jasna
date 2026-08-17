@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import MutableMapping
 from contextlib import nullcontext
 from dataclasses import dataclass
 from enum import StrEnum
@@ -12,8 +13,20 @@ import torch
 # spatial dimensions but a variable temporal clip length (and therefore variable
 # effective convolution batches), so FAST avoids repeated runtime profiling while
 # still using MIOpen's system/user performance databases. Users can override this.
+#
+# Expandable segments release memory by unmapping virtual address ranges rather
+# than by a device-synchronizing free, so a VramOffloader empty_cache() could
+# pull pages out from under kernels another thread still had in flight — issue
+# #252 caught a restorer fp16 GEMM faulting with "Page not present". The env
+# names cover the versions in the field; whichever one the build reads wins.
+def apply_rocm_env_defaults(environ: MutableMapping[str, str]) -> None:
+    environ.setdefault("MIOPEN_FIND_MODE", "FAST")
+    environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:False")
+    environ.setdefault("PYTORCH_HIP_ALLOC_CONF", "expandable_segments:False")
+
+
 if getattr(torch.version, "hip", None):
-    os.environ.setdefault("MIOPEN_FIND_MODE", "FAST")
+    apply_rocm_env_defaults(os.environ)
 
 
 class AcceleratorVendor(StrEnum):
@@ -28,7 +41,6 @@ class AcceleratorCapabilities:
     vendor: AcceleratorVendor
     pytorch_device_type: str
     tensorrt: bool
-    migraphx: bool
     nvcodec: bool
     amf: bool
     xpu: bool
@@ -67,7 +79,6 @@ def capabilities_for_device(
         vendor=vendor,
         pytorch_device_type=device_type,
         tensorrt=vendor is AcceleratorVendor.NVIDIA,
-        migraphx=vendor is AcceleratorVendor.AMD,
         nvcodec=vendor is AcceleratorVendor.NVIDIA,
         amf=vendor is AcceleratorVendor.AMD,
         xpu=vendor is AcceleratorVendor.INTEL,

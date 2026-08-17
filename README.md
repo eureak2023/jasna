@@ -4,8 +4,6 @@
 
 Jasna is a JAV mosaic restoration tool with a simple GUI, a CLI, a GPU-only processing pipeline, NVIDIA TensorRT and experimental AMD ROCm support, optional secondary restoration models, still-image restoration, and streaming support.
 
-It is inspired by, and in some places based on, [Lada](https://codeberg.org/ladaapp/lada). The `mosaic_restoration_1.2` restoration model used by Jasna was trained by ladaapp, the Lada author.
-
 Jasna is free. Supporters get a key that unlocks the extra models trained for this project: the **unet-4x** secondary upscaler and the experimental **SD 1.5 image restoration** model. See [Supporting the project](#supporting-the-project).
 
 <img width="1200" height="907" alt="image" src="https://github.com/user-attachments/assets/d59a914b-482d-4f37-ae72-5c59eb5dc9bb" />
@@ -21,16 +19,20 @@ Jasna is free. Supporters get a key that unlocks the extra models trained for th
 - [Learn More](#learn-more)
 - [Benchmarks](#benchmarks)
 - [Supporting the Project](#supporting-the-project)
+- [Acknowledgments](#acknowledgments)
 - [TODO](#todo)
 
 ## What Jasna Does
 
 - Restores mosaics in video files.
 - Restores mosaics in still images with the experimental SD 1.5 image model.
-- Detects mosaics with RF-DETR models by default; Lada and ZeLeFans YOLO models are also available.
-- Processes side-by-side VR180 videos per eye, with optional fisheye reprojection for detection and restoration.
+- Detects mosaics with the fast `rfdetr-v6` model by default; the larger RF-DETR variant and Lada and ZeLeFans YOLO models are also available.
+- Processes side-by-side VR180 videos per eye and automatically picks the best mosaic restoration handling for each studio; the Segment Editor can preview the options.
+- Supports frame-accurate ranges on NVIDIA and AMD GPUs, restoration previews, and zoom/pan inspection in the Segment Editor.
 - Reduces clip-boundary flicker with temporal overlap and crossfade.
+- Detects hard scene cuts and ends tracked clips at the boundary, so restoration never blends content across a cut.
 - Can further improve quality with optional [secondary restoration models](docs/en/models.md#secondary-restoration) — **unet-4x**, **RTX Super Resolution**, or **Topaz Video AI** — which sharpen restored regions, especially large mosaics, close-ups, and 4K video.
+- Includes a native GUI video player with full-screen playback and seeking through restored frames without creating an output file.
 - Can stream restored video to the built-in browser player or a supported Stash fork.
 
 ## Community
@@ -57,8 +59,8 @@ Jasna manages VRAM automatically: when it runs low, waiting frames are temporari
 4. Add a video or image, choose settings, and start processing.
 
 Every setting in the GUI has a tooltip — hover the ⓘ icon next to it. The
-[GUI guide](docs/en/gui.md) tours the rest: queue reordering, presets, output
-patterns, and more.
+[GUI guide](docs/en/gui.md) tours the rest: full-queue reruns, queue
+reordering, media actions, player shortcuts, presets, output patterns, and more.
 
 Prefer the command line?
 
@@ -85,28 +87,71 @@ If you run out of VRAM during processing, reduce **max clip size** first, for ex
 
 ## Learn More
 
-- **[Using the GUI](docs/en/gui.md)** — the queue (drag & drop, reordering), presets, output patterns and file conflicts, and other easy-to-miss features.
+- **[Using the GUI](docs/en/gui.md)** — the restored video player, queue, presets, output patterns, file conflicts, and other easy-to-miss features.
 - **[Choosing models](docs/en/models.md)** — which detection model to pick, sharper results with secondary restoration (unet-4x / RTX Super Resolution / Topaz), and SD 1.5 still-image restoration.
 - **[Restoring only parts of a video](docs/en/segments.md)** — the Segment Editor, built-in mosaic scanning, suggesting better masks, and the `--segments` CLI flag.
-- **[VR180 videos](docs/en/vr180.md)** — how Jasna handles side-by-side VR and when to use fisheye mode.
+- **[VR180 videos](docs/en/vr180.md)** — how Jasna handles side-by-side VR and picks the right settings per studio.
 - **[Tuning VRAM and GPU usage](docs/en/tuning.md)** — clip size, temporal overlap, model compilation, and what to do when VRAM runs out.
-- **[Advanced processing](docs/en/advanced_processing.md)** — denoising, 60→30 FPS export, color LUTs, custom encoder settings, and post-export actions.
+- **[Advanced processing](docs/en/advanced_processing.md)** — denoising, 60→30 FPS export, color LUTs, sharpening, literal encoder CQ controls, custom encoder settings, and queue-wide or per-video post-export actions.
 - **[Streaming](docs/en/streaming.md)** — watch restored video on the fly in your browser or through Stash.
-- **[CLI reference](docs/en/cli.md)** — every command-line option, including output templates, encoder settings per codec, and post-export actions.
+- **[CLI reference](docs/en/cli.md)** — every command-line option, including `--cq`, encoder settings per codec, and post-export actions.
 - **[Running from source](docs/en/development.md)** — developer setup and build notes.
 
 ## Benchmarks
 
-RTX 5090 + i9 13900k:
+End-to-end restoration measured on Linux with an RTX 5090 (driver 595.84) and
+i9-13900K.
+Jasna used its default models with `--max-clip-size 180 --temporal-overlap 15
+--secondary-restoration none`. Lada Flatpak 0.11.0 used the accurate `v2`
+detector, CUDA FP16, `--max-clip-length 180`, and its NVIDIA HEVC HQ preset.
+Frozen-release and Lada times are one measured run after a discarded warmup;
+v0.9.0 and v0.9.1 times are medians of three interleaved runs after warmup.
+Parenthetical ratios use Lada as the baseline; because Lada was not run on 8K,
+that row uses v0.9.0 as its baseline. The SONE clips contain 6,056 frames
+(3:22) each and the 8K VR clip 900 frames (15 s).
 
-| File                            | Clip (s) | lada 0.10.1 | jasna 0.3.0          | jasna 0.5.0          | **jasna 0.6.2**        |
-| ------------------------------- | -------: | ----------: | --------------------:| --------------------:| ----------------------:|
-| **ABF-017** (4k, 2h 25min)      | 60       | 02:56:26    | 01:20:49 (2.2x faster) | 01:10:00 (2.5x faster) | — |
-| **HUBLK-063** (1080p, 3h 10min) | 180      | 01:34:51    | 44:21 (2.1x faster)  | 37:57 (2.5x faster)  | **30:58 (3.1x faster)** |
-| **DASS-570_2m**                 | 30       | 01:08       | 00:30 (2.3x faster)  | 00:24 (2.8x faster)  | **00:20 (3.4x faster)** |
-| **NASK-223_Test**               | 30       | 03:12       | 01:18 (2.5x faster)  | 01:02 (3.1x faster)  | **00:58 (3.3x faster)** |
-| **test-007**                    | 30       | 01:16       | 00:41 (1.9x faster)  | 00:28 (2.7x faster)  | **00:22 (3.5x faster)** |
-| **厚码测试2**                   | 30       | 01:52       | 00:43 (2.6x faster)  | 00:36 (3.1x faster)  | **00:34 (3.3x faster)** |
+Only the releases where speed or GPU memory actually moved are listed, and one
+input per resolution. Every version and every codec is in the
+[full benchmark report](benchmarks/2026-07-26_release_matrix.md).
+
+| Input | Lada 0.11.0 v2 | v0.4.1 | v0.5.0 | v0.9.0 (4a171c9) | **v0.9.1 (18add8a)** |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 720p H.264 8-bit | 01:47 (baseline) | 01:35 (1.1x faster) | 00:45 (2.4x faster) | 00:34 (3.1x faster) | **00:32 (3.4x faster)** |
+| 1080p H.264 8-bit | 02:02 (baseline) | 01:46 (1.2x faster) | 00:47 (2.6x faster) | 00:39 (3.2x faster) | **00:34 (3.6x faster)** |
+| 2160p H.264 8-bit | 04:56 (baseline) | 03:23 (1.5x faster) | 01:22 (3.6x faster) | 01:15 (3.9x faster) | **01:03 (4.7x faster)** |
+| 8K VR HEVC 8-bit 60 fps | — | — | — | 00:34 (8K baseline) | — |
+
+GPU memory is median/peak GiB for the measured benchmark target; `—` means
+not run. Parenthetical ratios compare the median against v0.4.1, or against
+v0.9.0 on the 8K row that v0.4.1 never ran. Lada is left out of the comparison:
+it uses less GPU memory than any Jasna build.
+
+| Input | Lada | v0.4.1 | v0.5.0 | v0.9.0 | **v0.9.1** |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 720p H.264 8-bit | 1.8/3.1 | 17.6/19.9 (baseline) | 8.6/9.0 (2.0x less) | 8.6/9.1 (2.0x less) | **4.2/4.6 (4.2x less)** |
+| 1080p H.264 8-bit | 2.0/3.3 | 18.9/21.4 (baseline) | 9.5/10.2 (2.0x less) | 9.3/10.1 (2.0x less) | **4.8/5.6 (3.9x less)** |
+| 2160p H.264 8-bit | 2.6/4.1 | 26.0/30.5 (baseline) | 12.9/15.0 (2.0x less) | 11.4/15.4 (2.3x less) | **7.2/10.9 (3.6x less)** |
+| 8K VR HEVC 8-bit 60 fps | — | — | — | 17.1/18.3 (8K baseline) | — |
+
+The v0.9.1 drop in GPU memory comes from building the restoration sub-engines
+at fixed batch sizes instead of at the clip size — see the
+[engine batch report](benchmarks/2026-07-28_engine_batch_vram.md). For
+median/peak RAM, methodology, raw data, and performance-commit comparisons see
+the [full benchmark report](benchmarks/2026-07-26_release_matrix.md).
+
+### Legacy full-video benchmarks
+
+The original Linux results are retained below and enriched with the new
+v0.7.2 and v0.9.0 runs. They used the same RTX 5090 and i9-13900K; the listed
+clip size was preserved for each input.
+
+| File | Clip (s) | Lada 0.10.1 | Jasna 0.3.0 | Jasna 0.5.0 | Jasna 0.6.2 | Jasna 0.7.2 | **Jasna 0.9.0 (7d9cc8c)** |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **ABF-017** (4K, 2h 25min) | 60 | 02:56:26 | 01:20:49 (2.2x faster) | 01:10:00 (2.5x faster) | — | — | **42:17 (4.2x faster)** |
+| **HUBLK-063** (1080p, 3h 10min) | 180 | 01:34:51 | 44:21 (2.1x faster) | 37:57 (2.5x faster) | 30:58 (3.1x faster) | 23:38 (4.0x faster) | **18:01 (5.3x faster)** |
+| **DASS-570_2m** | 30 | 01:08 | 00:30 (2.3x faster) | 00:24 (2.8x faster) | 00:20 (3.4x faster) | 01:05 (1.0x faster) | **00:22 (3.1x faster)** |
+| **NASK-223_Test** | 30 | 03:12 | 01:18 (2.5x faster) | 01:02 (3.1x faster) | 00:58 (3.3x faster) | 01:07 (2.9x faster) | **01:01 (3.1x faster)** |
+| **test-007** | 30 | 01:16 | 00:41 (1.9x faster) | 00:28 (2.7x faster) | 00:22 (3.5x faster) | 00:27 (2.8x faster) | **00:27 (2.8x faster)** |
 
 ## Supporting the Project
 
@@ -126,6 +171,14 @@ How to get a key:
 2. After your contribution is processed, your supporter key is sent automatically:
    - **[Unifans](https://app.unifans.io/c/kruk2)**: sent by platform message. There might be a slight delay.
    - **[Buy Me a Coffee](https://buymeacoffee.com/kruk2)**, including **crypto**: sent to the email or handle used for the contribution. The key is tied to that email or handle.
+
+## Acknowledgments
+
+- **[Lada](https://codeberg.org/ladaapp/lada) (Codeberg)** — Jasna is inspired
+  by, and in some places based on, Lada. The `mosaic_restoration_1.2`
+  restoration model used by Jasna was trained by ladaapp, the Lada author.
+- **ZeLeFans** — for the VR detection model and the in-depth analysis of mosaic
+  shapes and VR projection.
 
 ## TODO
 

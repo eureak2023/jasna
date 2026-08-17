@@ -5,13 +5,19 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from torch.nn import functional as F
 
 logger = logging.getLogger(__name__)
-from torch.nn import functional as F
 
 from jasna.accelerator import is_amd_device, is_nvidia_device
 from jasna.engine_paths import get_onnx_tensorrt_engine_path
+from jasna.media.resize_normalize import ResizeNormalizer
 from jasna.mosaic.detections import Detections
+from jasna.tensor_utils import pad_batch_with_last
+
+
+_IMAGENET_MEAN = (0.485, 0.456, 0.406)
+_IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
 def TrtRunner(*args, **kwargs):
@@ -21,23 +27,18 @@ def TrtRunner(*args, **kwargs):
 
 
 def compile_rfdetr_engine(
-    onnx_path: Path,
+    weights_path: Path,
     device: torch.device,
+    *,
     batch_size: int,
-    fp16: bool = True,
+    resolution: int,
+    dynamic_batch: bool,
+    fp16: bool,
 ) -> Path:
     if is_amd_device(device):
-        from jasna.mosaic.migraphx_runner import MigraphxRunner
-
-        runner = MigraphxRunner(
-            onnx_path,
-            input_shapes=[(int(batch_size), 3, 768, 768)],
-            device=device,
-            fp16=bool(fp16),
-        )
-        cache_path = runner.cache_dir or onnx_path
-        runner.close()
-        return cache_path
+        # AMD runs the trained checkpoint through the rfdetr torch model
+        # (RfDetrTorchRunner); there is no ahead-of-time engine to build.
+        return weights_path
     if not is_nvidia_device(device):
         raise RuntimeError(
             f"RF-DETR is not supported on device backend {device.type!r}"
@@ -45,52 +46,67 @@ def compile_rfdetr_engine(
 
     from jasna.trt import compile_onnx_to_tensorrt_engine
     return compile_onnx_to_tensorrt_engine(
-        onnx_path,
+        weights_path,
         device,
         batch_size=int(batch_size),
         fp16=bool(fp16),
         workspace_gb=20,
+        dynamic_batch=dynamic_batch,
     )
 
 
 class RfDetrMosaicDetectionModel:
-    DEFAULT_RESOLUTION = 768
     DEFAULT_SCORE_THRESHOLD = 0.25
     DEFAULT_MAX_SELECT = 16
 
     def __init__(
         self,
         *,
-        onnx_path: Path,
+        weights_path: Path,
         batch_size: int,
         device: torch.device,
-        resolution: int = DEFAULT_RESOLUTION,
+        resolution: int,
+        dynamic_batch: bool,
+        torch_variant: str | None = None,
         score_threshold: float = DEFAULT_SCORE_THRESHOLD,
         max_select: int = DEFAULT_MAX_SELECT,
         fp16: bool = True,
     ) -> None:
-        self.onnx_path = onnx_path
+        self.weights_path = weights_path
         self.batch_size = int(batch_size)
         self.device = device
         self.resolution = int(resolution)
+        self.dynamic_batch = bool(dynamic_batch)
         self.score_threshold = float(score_threshold)
         self.max_select = int(max_select)
+        self._normalization_cache: dict[
+            tuple[torch.device, torch.dtype], tuple[torch.Tensor, torch.Tensor]
+        ] = {}
+        if self.batch_size <= 0:
+            raise ValueError(f"batch_size must be > 0, got {batch_size}")
 
         if is_amd_device(self.device):
-            from jasna.mosaic.migraphx_runner import MigraphxRunner
+            if torch_variant is None:
+                raise RuntimeError(
+                    f"RF-DETR on AMD requires a torch variant for {weights_path.name}"
+                )
+            from jasna.mosaic.rfdetr_torch_runner import RfDetrTorchRunner
 
-            self.runner = MigraphxRunner(
-                self.onnx_path,
+            self.runner = RfDetrTorchRunner(
+                self.weights_path,
                 input_shapes=[
                     (self.batch_size, 3, self.resolution, self.resolution)
                 ],
                 device=self.device,
                 fp16=bool(fp16),
+                resolution=self.resolution,
+                variant=torch_variant,
             )
-            self.engine_path = self.runner.cache_dir or self.onnx_path
+            self.engine_path = self.weights_path
         elif is_nvidia_device(self.device):
             self.engine_path = get_onnx_tensorrt_engine_path(
-                self.onnx_path, batch_size=self.batch_size, fp16=bool(fp16),
+                self.weights_path, batch_size=self.batch_size, fp16=bool(fp16),
+                dynamic_batch=self.dynamic_batch,
             )
             if not self.engine_path.exists():
                 raise FileNotFoundError(
@@ -110,9 +126,24 @@ class RfDetrMosaicDetectionModel:
             )
         self._input_name = self.runner.input_names[0]
         self.input_dtype = self.runner.input_dtypes[self._input_name]
+        resizer = ResizeNormalizer(
+            device=self.device,
+            dtype=self.input_dtype,
+            mean=_IMAGENET_MEAN,
+            std=_IMAGENET_STD,
+            fill=(0.0, 0.0, 0.0),
+        )
+        self._resizer = resizer if resizer.available else None
 
         self.boxes_out = next(
-            k for k in self.runner.output_names if self.runner.outputs[k].ndim == 3 and self.runner.outputs[k].shape[-1] == 4
+            name
+            for name in self.runner.output_names
+            if self.runner.outputs[name].ndim == 3
+            and (
+                self.runner.outputs[name].shape[-1] == 4
+                or name.lower() == "dets"
+                or "box" in name.lower()
+            )
         )
         self.masks_out = next(k for k in self.runner.output_names if self.runner.outputs[k].ndim == 4)
         self.logits_out = next(k for k in self.runner.output_names if k not in {self.boxes_out, self.masks_out})
@@ -123,12 +154,47 @@ class RfDetrMosaicDetectionModel:
             self.runner.close()
             self.runner = None
 
+    def _normalization(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        key = (x.device, x.dtype)
+        cached = self._normalization_cache.get(key)
+        if cached is None:
+            mean = x.new_tensor(_IMAGENET_MEAN)[:, None, None]
+            std = x.new_tensor(_IMAGENET_STD)[:, None, None]
+            cached = (mean, std)
+            self._normalization_cache[key] = cached
+        return cached
+
     def _preprocess(self, frames_uint8_bchw: torch.Tensor) -> torch.Tensor:
+        if self._resizer is not None and frames_uint8_bchw.dtype is torch.uint8:
+            return self._resizer.run(
+                frames_uint8_bchw,
+                out_hw=(self.resolution, self.resolution),
+                content=(0, 0, self.resolution, self.resolution),
+            )
         x = frames_uint8_bchw.to(device=self.device, dtype=self.input_dtype).div_(255.0)
         x = F.interpolate(x, size=(self.resolution, self.resolution), mode="bilinear", align_corners=False)
-        mean = x.new_tensor([0.485, 0.456, 0.406])[:, None, None]
-        std = x.new_tensor([0.229, 0.224, 0.225])[:, None, None]
+        mean, std = self._normalization(x)
         return (x - mean) / std
+
+    def _infer(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        if self.dynamic_batch:
+            return self.runner.infer({self._input_name: x})
+
+        output_parts: dict[str, list[torch.Tensor]] = {
+            name: [] for name in self.runner.output_names
+        }
+        for chunk in x.split(self.batch_size):
+            effective_batch_size = int(chunk.shape[0])
+            padded = pad_batch_with_last(chunk, batch_size=self.batch_size)
+            outputs = self.runner.infer({self._input_name: padded})
+            for name in output_parts:
+                output_parts[name].append(
+                    outputs[name][:effective_batch_size].clone()
+                )
+        return {
+            name: torch.cat(parts, dim=0)
+            for name, parts in output_parts.items()
+        }
 
     @staticmethod
     def _postprocess(
@@ -177,7 +243,7 @@ class RfDetrMosaicDetectionModel:
         host synchronization."""
 
         x = self._preprocess(frames_uint8_bchw)
-        outs = self.runner.infer({self._input_name: x})
+        outs = self._infer(x)
         per_query = outs[self.logits_out].sigmoid().amax(dim=-1)  # (B, Q)
         scores = per_query.amax(dim=-1).float()  # (B,)
         pred_masks = outs[self.masks_out]  # (B, Q, Hm, Wm)
@@ -188,7 +254,7 @@ class RfDetrMosaicDetectionModel:
 
     def __call__(self, frames_uint8_bchw: torch.Tensor, *, target_hw: tuple[int, int]) -> Detections:
         x = self._preprocess(frames_uint8_bchw)
-        outs = self.runner.infer({self._input_name: x})
+        outs = self._infer(x)
         boxes_list, masks_list = self._postprocess(
             pred_boxes=outs[self.boxes_out],
             pred_logits=outs[self.logits_out],

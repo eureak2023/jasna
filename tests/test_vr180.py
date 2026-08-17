@@ -8,10 +8,12 @@ import torch
 from jasna.media import VideoMetadata
 from jasna.mosaic.detections import Detections
 from jasna.vr180 import (
-    FISHEYE_STUDIO_TOKENS,
     DIRECT_STUDIO_TOKENS,
-    FisheyeProjector,
+    FISHEYE_STUDIO_TOKENS,
+    PROJECTION_CHOICES,
+    STUDIO_PROJECTION,
     SbsDetectionAdapter,
+    resolve_projection,
     resolve_vr_mode,
 )
 
@@ -48,7 +50,8 @@ def _metadata(
 @pytest.mark.parametrize("token", sorted(FISHEYE_STUDIO_TOKENS))
 def test_auto_resolves_known_fisheye_studios(token: str) -> None:
     result = resolve_vr_mode("auto", _metadata(), Path(f"{token}-001.mp4"))
-    assert result.resolved == "sbs-fisheye"
+    assert result.resolved == "sbs"
+    assert result.projection == "fisheye"
     assert token in result.reason
 
 
@@ -61,7 +64,19 @@ def test_auto_resolves_known_direct_sbs_studios(token: str) -> None:
 
 def test_auto_fisheye_studio_overrides_direct_token() -> None:
     result = resolve_vr_mode("auto", _metadata(), Path("VRKM-FSVSS-001.mp4"))
-    assert result.resolved == "sbs-fisheye"
+    assert result.resolved == "sbs"
+    assert result.projection == "fisheye"
+
+
+def test_auto_matches_studio_code_glued_to_number() -> None:
+    # Real 8K releases glue the studio code to the number (savr00327-2);
+    # detection is a substring match, not a separator-bounded token.
+    savr = resolve_vr_mode("auto", _metadata(), Path("savr00327-2.mp4"))
+    assert savr.resolved == "sbs"
+    assert savr.projection == "fisheye"
+    mdvr = resolve_vr_mode("auto", _metadata(), Path("mdvr00271-2.mp4"))
+    assert mdvr.resolved == "sbs"
+    assert mdvr.projection == "raw"
 
 
 def test_auto_uses_spatial_metadata_for_sbs() -> None:
@@ -115,12 +130,70 @@ def test_explicit_sbs_rejects_odd_width() -> None:
 
 
 def test_explicit_mode_overrides_auto_detection() -> None:
-    assert resolve_vr_mode(
-        "sbs-fisheye", _metadata(), Path("unknown.mp4")
-    ).resolved == "sbs-fisheye"
+    explicit_fe = resolve_vr_mode("sbs-fisheye", _metadata(), Path("unknown.mp4"))
+    assert explicit_fe.resolved == "sbs"
+    assert explicit_fe.projection == "fisheye"
     assert resolve_vr_mode(
         "off", _metadata(), Path("FSVSS-001.mp4")
     ).resolved == "off"
+
+
+@pytest.mark.parametrize("projection", PROJECTION_CHOICES[1:])
+def test_projection_override_applies_to_detected_vr(projection: str) -> None:
+    result = resolve_vr_mode(
+        "auto",
+        _metadata(),
+        Path("pxvr-001.mp4"),
+        projection=projection,
+    )
+
+    assert result.is_sbs
+    assert result.projection == projection
+
+
+def test_projection_override_does_not_enable_vr_layout() -> None:
+    result = resolve_vr_mode(
+        "auto",
+        _metadata(width=1920, height=1080),
+        Path("movie.mp4"),
+        projection="gnomonic",
+    )
+
+    assert not result.is_sbs
+    assert result.projection == "none"
+
+
+@pytest.mark.parametrize(("code", "kind"), sorted(STUDIO_PROJECTION.items()))
+def test_resolve_projection_routes_confident_studios(code: str, kind: str) -> None:
+    assert resolve_projection(Path(f"{code}-001.mp4")) == kind
+    assert resolve_projection(Path(f"{code.lower()}00123-4.mp4")) == kind
+
+
+def test_resolve_projection_falls_back_to_raw_for_unknown_studio() -> None:
+    assert resolve_projection(Path("unknownvr-001.mp4")) == "raw"
+    # Direct-SBS token with no routing entry stays raw (its studio prior).
+    assert resolve_projection(Path("mdvr00271-2.mp4")) == "raw"
+
+
+def test_resolve_projection_fisheye_token_without_table_entry() -> None:
+    # SAVR/URVRSP are fisheye-shot but absent from the confident table;
+    # the fisheye-token prior still routes them to fisheye.
+    assert resolve_projection(Path("savr00327-2.mp4")) == "fisheye"
+    assert resolve_projection(Path("urvrsp00285-3.mp4")) == "fisheye"
+
+
+def test_resolve_projection_explicit_override_wins() -> None:
+    assert resolve_projection(Path("ipvr-001.mp4"), requested="gnomonic") == "gnomonic"
+    assert resolve_projection(Path("pxvr-001.mp4"), requested="raw") == "raw"
+
+
+def test_resolve_projection_rejects_unknown_override() -> None:
+    with pytest.raises(ValueError, match="Unknown VR projection"):
+        resolve_projection(Path("movie.mp4"), requested="cylindrical")
+
+
+def test_resolve_projection_strips_release_site_tag() -> None:
+    assert resolve_projection(Path("[98T.TV]VRPRD-004-A.mp4")) == "gnomonic"
 
 
 class _FakeDetector:
@@ -216,59 +289,3 @@ def test_sbs_adapter_rejects_odd_source_width() -> None:
             torch.zeros((1, 3, 4, 7), dtype=torch.uint8),
             target_hw=(4, 7),
         )
-
-
-def test_fisheye_projector_uses_eye_local_grids() -> None:
-    projector = FisheyeProjector(eye_width=8, height=8, device=torch.device("cpu"))
-    assert projector.forward_grid.shape == (1, 8, 8, 2)
-    assert projector.inverse_grid.shape == (1, 8, 8, 2)
-
-
-def test_fisheye_projector_keeps_eyes_isolated() -> None:
-    projector = FisheyeProjector(eye_width=8, height=8, device=torch.device("cpu"))
-    frame = torch.zeros((3, 8, 16), dtype=torch.uint8)
-    frame[:, :, :8] = 25
-    frame[:, :, 8:] = 200
-
-    projected = projector.forward_sbs(frame)
-
-    assert projected[:, :, :8].max().item() <= 25
-    assert projected[:, :, 8:].max().item() == 200
-    assert projected[:, :, 8:].min().item() == 0
-
-
-def test_fisheye_delta_composition_preserves_untouched_source_pixels() -> None:
-    projector = FisheyeProjector(eye_width=16, height=16, device=torch.device("cpu"))
-    source = torch.randint(0, 256, (3, 16, 32), dtype=torch.uint8)
-    projected = projector.forward_sbs(source)
-
-    restored = projector.restore_delta_to_source(source, projected, projected.clone())
-
-    assert torch.equal(restored, source)
-
-
-def test_fisheye_delta_composition_applies_changes_without_background_roundtrip() -> None:
-    projector = FisheyeProjector(eye_width=16, height=16, device=torch.device("cpu"))
-    source = torch.full((3, 16, 32), 100, dtype=torch.uint8)
-    projected = projector.forward_sbs(source)
-    blended = projected.clone()
-    blended[:, 7:9, 7:9] = 140
-
-    restored = projector.restore_delta_to_source(source, projected, blended)
-
-    changed = restored != source
-    assert changed.any()
-    assert torch.equal(restored[~changed], source[~changed])
-
-
-def test_fisheye_inverse_mask_keeps_full_sbs_shape_and_eye_isolation() -> None:
-    projector = FisheyeProjector(eye_width=8, height=8, device=torch.device("cpu"))
-    masks = torch.zeros((2, 8, 16), dtype=torch.bool)
-    masks[0, 3:5, 3:5] = True
-    masks[1, 3:5, 11:13] = True
-
-    source_masks = projector.inverse_mask_sbs(masks)
-
-    assert source_masks.shape == masks.shape
-    assert source_masks[0, :, 8:].sum().item() == 0
-    assert source_masks[1, :, :8].sum().item() == 0

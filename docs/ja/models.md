@@ -4,15 +4,30 @@
 
 検出モデルは各フレーム内のモザイクを見つけます。
 
-- **最新の RF-DETR モデル**（`rfdetr-v5`）を使ってください — デフォルトで、
-  最もバランスの取れた選択です。
+- **最新の RF-DETR モデル**（`rfdetr-v6`）を使ってください — デフォルトかつ
+  高速で、最もバランスの取れた選択です。Jasna に同梱されています。
+- **`rfdetr-v6-large`** は高品質だが低速の派生モデルで、4K 動画ではこちらの
+  ほうが良い場合があります。別途ダウンロードの
+  任意モデルです。お使いのグラフィックスカード用のファイルを
+  `model_weights/` に置くと自動的に検出されます。
+  - NVIDIA:
+    [rfdetr-v6-large.onnx](https://github.com/Kruk2/jasna/releases/download/0.1/rfdetr-v6-large.onnx)
+  - AMD:
+    [rfdetr-v6-large.pt](https://github.com/Kruk2/jasna/releases/download/0.1/rfdetr-v6-large.pt)
 - **Lada YOLO** モデルは 2D アニメーションでより良い場合があります。
-- **zelefans-vr-yolo-v2**（同梱）は VR180 動画でより正確な場合があります。
-- **AMD では** RF-DETR は非常に遅く（Windows では CPU で動くほどです）、
-  RF-DETR が特に必要でない限り `lada-yolo-v4` を使ってください。
+- **rfdetr-vr-v1**（同梱）は VR180 用の RF-DETR 検出モデルで、VR180 動画に最適です。
+- **zelefans-vr-yolo-v2**（任意ダウンロード）は VR180 の代替検出モデルです。
+- **AMD では** RF-DETR はグラフィックスカードで動き、`.pt` のモデルファイルを
+  使います（NVIDIA は `.onnx`）。NVIDIA より遅いので、検出品質より速度を
+  優先する場合は `lada-yolo-v4` を選んでください。
+
+各モデルは既定で推奨検出しきい値を適用します（`rfdetr-v6`：0.35、
+`rfdetr-v6-large`：0.40）。`--detection-score-threshold` で上書きできます。
+
+旧 `rfdetr-v5` モデルも引き続き利用できます。
 
 ```bash
-jasna --input input.mp4 --output output.mkv --detection-model rfdetr-v5
+jasna --input input.mp4 --output output.mkv --detection-model rfdetr-v6
 ```
 
 [区間エディター](segments.md)の中で、動画ごとに別の検出モデルを

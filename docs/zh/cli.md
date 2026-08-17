@@ -23,8 +23,8 @@ jasna --input input_folder --output output_folder
 | `--input` | — | 视频、图像或文件夹。 |
 | `--output` | — | 输出文件；当 `--input` 是文件夹时为输出文件夹。 |
 | `--output-pattern` | `{original}_out` | 文件夹输入的文件名模板。`{original}` 是输入文件名主干。图像保留源扩展名；视频在模板提供扩展名时使用该扩展名。Jasna 会在处理前检查计划输出路径，如果两个输入映射到同一个文件则报错退出。 |
-| `--device` | `cuda:0` | GPU 选择。在 AMD Linux 上同时选择 MIGraphX GPU。 |
-| `--batch-size` | `4` | 检测批处理大小。 |
+| `--device` | `cuda:0` | GPU 选择。AMD 显卡通过 ROCm 也使用相同的 `cuda:N` 名称。 |
+| `--batch-size` | `4` | 检测批处理大小。旧版 `rfdetr-v5` 始终使用 4。 |
 | `--fp16` / `--no-fp16` | 开启 | 在支持的环节使用 FP16（修复 + TensorRT）。降低 VRAM，可能提升速度。 |
 | `--log-level` | `error` | `debug`、`info`、`warning`、`error`。 |
 | `--no-progress` | 关闭 | 禁用进度条。 |
@@ -46,9 +46,12 @@ jasna --input input_folder --output output_folder
 
 | 选项 | 默认值 | 说明 |
 | ------ | ------- | ----- |
-| `--detection-model` | `rfdetr-v5` | 已安装模型从 `model_weights/` 中发现；`zelefans-vr-yolo-v2` 已内置。见[模型](models.md)。 |
-| `--detection-model-path` | 自动 | 默认为 `model_weights/<detection-model>.onnx`（RF-DETR）或 `.pt`（YOLO）。 |
-| `--detection-score-threshold` | `0.25` | 漏检马赛克时调低；正常区域被误检时调高。 |
+| `--detection-model` | `rfdetr-v6` | 已安装模型从 `model_weights/` 中发现；`rfdetr-v6`（快速）和 `rfdetr-vr-v1`（VR180）已内置，`rfdetr-v6-large` 和 `zelefans-vr-yolo-v2` 为可选下载。见[模型](models.md)。 |
+| `--detection-model-path` | 自动 | 默认为 `model_weights/<detection-model>`，并使用适合你显卡的文件类型：RF-DETR 在 NVIDIA 上用 `.onnx`，在 AMD 上用 `.pt`；YOLO 始终用 `.pt`。 |
+| `--detection-score-threshold` | 自动 | 默认使用所选模型的推荐值（`rfdetr-v6`：0.35，`rfdetr-v6-large`：0.40）。漏检马赛克时调低；正常区域被误检时调高。 |
+| `--max-detection-gap` | `2` | 当马赛克在相同位置重新出现时，填补最多 N 帧的检测中断。`0` 表示禁用。 |
+| `--min-detection-duration` | `2` | 丢弃持续少于 N 帧的检测（视为误检，相应帧保持原样）。`0` 表示禁用。 |
+| `--scene-detection` | 开 | 检测硬切镜头并在切换点结束所有跟踪中的马赛克片段，使片段不会跨越两个镜头。使用 `--no-scene-detection` 关闭。 |
 
 ## 二级修复
 
@@ -64,6 +67,7 @@ jasna --input input_folder --output output_folder
 | `--tvai-scale` | `4` | 输出尺寸为 `256*scale`；`1` = 不放大。 |
 | `--tvai-args` | 见 `--help` | 额外的 `tvai_up` 参数。 |
 | `--tvai-workers` | `2` | 并行的 TVAI ffmpeg 工作进程数。 |
+| `--tvai-denoise` | 关闭 | 在 TVAI 增强处理前应用降噪。 |
 
 ## SD 1.5 图像修复
 
@@ -89,10 +93,13 @@ jasna --input input_folder --output output_folder
 | 选项 | 默认值 | 说明 |
 | ------ | ------- | ----- |
 | `--codec` | `hevc` | 离线输出可选 `hevc`、`h264` 或 `av1`。HLS 流媒体始终使用 H.264。 |
-| `--encoder-settings` | — | JSON 对象或逗号分隔的 `key=value`，例如 `{"cq":22}` 或 `cq=22,rc-lookahead=32`。见下文。 |
+| `--cq` | 根据 GPU/编解码器 | 原样传给编码器的质量目标。越低质量越好、文件越大。NVIDIA 默认值：H.264 25、HEVC 28、AV1 35；AMD 默认值：H.264 24、HEVC 25、AV1 32。 |
+| `--encoder-settings` | — | JSON 对象或逗号分隔的高级 `key=value` 设置，例如 `{"rc-lookahead":32}` 或 `rc-lookahead=32,bf=4`。见下文。 |
 | `--lut` | — | `.cube` 色彩 LUT（1D 或 3D），编码前由 GPU 应用。也可在 GUI 的编码设置部分设置。 |
+| `--sharpen` | `0` | 编码前锐化画面，取值 `0`（关闭）到 `1`（最强）。与 ffmpeg 的 `cas` 滤镜一致，无需二次转码。见[高级处理](advanced_processing.md)。 |
 | `--retarget-high-fps` | 关闭 | 通过每两帧处理一帧实现 60 → 30 FPS（以及 59.94 → 29.97）。其他帧率不变；音频时序保持不变。 |
-| `--segments` | — | 只修复选定区间，例如 `10-25,01:10-01:30.5`。不能与 `--stream` 或 `--retarget-high-fps` 同时使用。见[区间](segments.md)。 |
+| `--fmp4` | 关闭 | `.mp4`/`.mov` 输出在生成过程中即可播放，任务中断后仍可播放。不能与 `--stream` 或 `--segments` 同时使用。见[高级处理](advanced_processing.md)。 |
+| `--segments` | — | 只修复选定区间，例如 `10-25,01:10-01:30.5`。不能与 `--stream`、`--retarget-high-fps` 或 `--fmp4` 同时使用。见[区间](segments.md)。 |
 | `--working-directory` | 输出目录 | 区间临时文件的写入位置。见[区间](segments.md)。 |
 
 ### 选择编解码器
@@ -109,23 +116,37 @@ jasna --input input_folder --output output_folder
 
 ### 编码器设置
 
-`--encoder-settings` 用于微调硬件编码器。参数会根据当前编码器进行
-校验 — 不支持的参数会失败，并给出清晰的错误提示，列出该编码器接受的
-参数。通常你只需要 `cq`:
+`--cq` 是主要的质量控制。GUI 显示或命令行输入的数值会原样传给当前编码器；
+切换编解码器不会转换数值。数值越低，质量越好，文件越大。
+
+| GPU | H.264 默认值 | HEVC 默认值 | AV1 默认值 | 允许范围 |
+| --- | ---: | ---: | ---: | --- |
+| NVIDIA | 25 | 28 | 35 | H.264/HEVC 为 1–51；AV1 为 1–63 |
+| AMD | 24 | 25 | 32 | 0–51 |
+
+NVIDIA 将 CQ 0 保留为自动值，因此 Jasna 要求显式质量目标从 1 开始。在编辑当前
+任务期间，GUI 会分别记住每个编解码器的原始数值。
+
+`--encoder-settings` 用于微调其他硬件编码器设置。参数会根据当前编码器进行
+校验 — 不支持的参数会失败，并给出清晰的错误提示，列出该编码器接受的参数:
 
 ```bash
-# Higher quality (bigger file): lower cq. Default is 25 (HEVC), 24 (H.264), 32 (AV1).
-jasna --input in.mp4 --output out.mkv --encoder-settings "cq=22"
+# 要提高质量（并增大文件），请降低 CQ。
+jasna --input in.mp4 --output out.mkv --cq 22
 
-# Multiple keys
-jasna --input in.mp4 --output out.mkv --encoder-settings "cq=22,rc-lookahead=32,bf=4"
+# CQ 与高级设置
+jasna --input in.mp4 --output out.mkv --cq 22 --encoder-settings "rc-lookahead=32,bf=4"
 ```
+
+为保持兼容，省略 `--cq` 时仍可在 `--encoder-settings` 中使用 `cq=22`。若通过
+两个入口同时指定 CQ，Jasna 会报错，而不会静默选择其中一个。GUI 中的 CQ 控件是
+唯一入口，因此**自定义参数**不接受 CQ 别名。
 
 #### NVIDIA (NVENC) 参数 — 所有编解码器
 
 | 参数 | 作用 |
 | --- | ------------ |
-| `cq` | VBR 的目标质量。**最主要的质量参数。**越低 = 质量越好、文件越大。H.264/HEVC 范围 0–51（默认 24/25），AV1 范围 0–63（默认 32）。 |
+| `cq` | VBR 的目标质量。越低 = 质量越好、文件越大。H.264/HEVC 的原值范围为 1–51（默认 25/28），AV1 为 1–63（默认 35）。输出体积自动上限可能让相近的数值得到相同结果。 |
 | `preset` | 速度/质量权衡，从 `p1`（最快）到 `p7`（最佳）。默认 `p5`。 |
 | `tune` | `hq`（默认）、`ll`、`ull` 或 `lossless`。 |
 | `rc` | 码率控制模式: `vbr`（默认）、`cbr`、`constqp`。 |
@@ -141,10 +162,30 @@ jasna --input in.mp4 --output out.mkv --encoder-settings "cq=22,rc-lookahead=32,
 | `aq-strength` | AQ 强度，1–15。默认 8。 |
 | `rc-lookahead` | 码率控制的前瞻分析帧数。默认 32。 |
 | `lookahead_level` | 前瞻质量，0–3。仅 HEVC/AV1 — 在 H.264 上会被忽略并警告（编码器无法使用它）。 |
-| `maxrate` / `bufsize` | 码率上限和 VBV 缓冲区大小，用于需要硬性码率限制的场景。 |
+| `maxrate` / `bufsize` | 码率上限和 VBV 缓冲区大小（比特/秒）。Jasna 会根据源码率自动设置（见下文）；自行指定 `maxrate` 则以你的值为准。 |
 | `multipass` | 两遍编码: `disabled`、`qres`、`fullres`。 |
 | `weighted_pred` | 加权预测。NVENC 仅在 `bf=0` 时支持；否则（以及 AV1 上始终）会被忽略并警告。 |
 | `tf_level` | 时间滤波级别。 |
+
+#### 输出体积自动上限
+
+`cq` 只针对固定质量，不考虑源文件的存储方式，因此低码率保存的源会被重新编码到远高于
+其自身质量的水平，体积膨胀数倍。为此，Jasna 会根据源视频码率推导 `maxrate`，并将
+`bufsize` 设为其两倍：
+
+| 情况 | 上限 |
+| ---- | ---- |
+| NVIDIA H.264 输出 | 源视频码率的 2.0 倍 |
+| 其他输出，HEVC 源 | 源视频码率的 1.25 倍 |
+| 其他组合 | 源视频码率的 1.0 倍 |
+
+NVIDIA H.264 获得更多余量，因为保留修复后的细节需要更多码率。该上限只对低码率保存的源
+生效；码率充足的源不受影响。达到上限时，CQ 仍是目标质量，但相近的数值可能得到相同的
+码率和文件大小。
+
+自行指定 `maxrate` 即可替换；设为很大的值可实际停用。若源完全没有报告码率，Jasna 会
+记录警告并在无上限的情况下编码。
+
 
 各编解码器额外参数:
 
@@ -158,8 +199,8 @@ jasna --input in.mp4 --output out.mkv --encoder-settings "cq=22,rc-lookahead=32,
 
 | 参数 | 作用 |
 | --- | ------------ |
-| `cq` | 通用质量参数，自动转换为 AMF 的 `qvbr_quality_level`。越低越好。默认 24（H.264）、25（HEVC）、32（AV1）。 |
-| `qvbr_quality_level` | AMF 原生质量级别，如果你想直接设置它。 |
+| `cq` | 数值不变、作为 AMF `qvbr_quality_level` 传递的质量目标。越低越好。范围 0–51；默认 24（H.264）、25（HEVC）、32（AV1）。 |
+| `qvbr_quality_level` | AMF 原生别名。省略 `--cq` 时可用于 CLI 高级设置；GUI 自定义参数中不接受。 |
 | `usage` | 编码器用途配置。默认 `high_quality`。 |
 | `quality` | 速度/质量预设: `speed`、`balanced`、`quality`（默认）。 |
 | `rc` | 码率控制模式。默认 `qvbr`。 |
@@ -168,7 +209,7 @@ jasna --input in.mp4 --output out.mkv --encoder-settings "cq=22,rc-lookahead=32,
 | `bf` | 最大连续 B 帧数。 |
 | `preanalysis` | 预分析，默认开启。 |
 | `vbaq` | 基于方差的自适应量化，默认开启。 |
-| `maxrate` / `bufsize` | 码率上限和 VBV 缓冲区大小。 |
+| `maxrate` / `bufsize` | 码率上限和 VBV 缓冲区大小（比特/秒）。除非指定 `maxrate`，否则会根据源码率自动设置。 |
 | `profile` / `level` | 编解码器 profile 和 level。 |
 
 各编解码器额外参数:
@@ -176,7 +217,7 @@ jasna --input in.mp4 --output out.mkv --encoder-settings "cq=22,rc-lookahead=32,
 | 编解码器 | 额外参数 |
 | ----- | ---------- |
 | `hevc` | `tier`、`bitdepth`（默认 10） |
-| `h264` | `coder` |
+| `h264` | `coder`、`bf_ref`（B 帧引用）、`pa_adaptive_mini_gop`（自适应 B 帧排列） |
 | `av1` | `bitdepth`（默认 10） |
 
 ## 流媒体
@@ -194,10 +235,12 @@ jasna --input in.mp4 --output out.mkv --encoder-settings "cq=22,rc-lookahead=32,
 | ------ | ------- | ----- |
 | `--post-export-action` | `none` | `shutdown` 或 `command`，在所有导出完成后运行。 |
 | `--post-export-command` | — | `--post-export-action command` 使用的 shell 命令。 |
+| `--post-export-video-command` | — | 每个视频成功导出后运行的 shell 命令。支持 `{input}`、`{output}`、`{output_dir}`、`{output_stem}` 和 `{output_suffix}`。 |
 
 ```bash
 jasna --input input.mp4 --output output.mkv --post-export-action shutdown
 jasna --input folder_in --output folder_out --post-export-action command --post-export-command "echo done"
+jasna --input folder_in --output folder_out --post-export-video-command "ffmpeg -i {output} -map 0 -map_metadata 0 -map_chapters 0 -c copy -movflags +faststart {output_dir}/{output_stem}_remuxed{output_suffix}"
 ```
 
 ## 许可证

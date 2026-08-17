@@ -13,6 +13,33 @@ and raise it only if artifacts remain.
 By default it runs before secondary restoration;
 `--denoise-step after_secondary` moves it right before blending.
 
+## Detection stability filtering
+
+Detection is not perfect frame-to-frame: a mosaic can vanish for a frame or
+two (cutting one clip into several, with a visible seam and an unrestored
+frame), and a single-frame false detection triggers a needless restore.
+
+- **Max Detection Gap** (`--max-detection-gap`, default `2`) fills dropouts
+  up to N frames when the mosaic reappears at the same spot, keeping the
+  clip continuous.
+- **Min Detection Duration** (`--min-detection-duration`, default `2`) drops
+  detections shorter than N frames as false positives; those frames stay
+  unrestored.
+
+Keep both small so genuine fast appear/disappear moments are unaffected.
+`0` disables either.
+
+## Scene cut detection
+
+Without it, a mosaic tracked across a hard scene cut can end up in one clip
+spanning two different shots, and the restorer blends content across the
+cut. **Scene Cut Detection** (`--scene-detection`, default on) detects hard
+cuts and ends every tracked clip at the boundary, so each clip stays within
+a single shot. It runs on the GPU with negligible cost.
+
+Disable with `--no-scene-detection` (or the switch in the GUI's Advanced
+section) only if you see clips being split where there is no real cut.
+
 ## 60 FPS to 30 FPS export
 
 For 60 (or 59.94) FPS input, **Reduce 60 FPS to 30 FPS**
@@ -26,6 +53,21 @@ jasna --input input.mp4 --output output.mp4 --retarget-high-fps
 
 Cannot be combined with [segment processing](segments.md).
 
+## Playable while processing (fragmented MP4)
+
+A normal MP4 can only be opened once the job is finished. **Playable while
+processing** (`--fmp4`) lets you play the output while it is still being made —
+handy for checking quality without waiting — and the file stays playable if a
+job is interrupted:
+
+```bash
+jasna --input input.mp4 --output output.mp4 --fmp4
+```
+
+The video grows in steps of a few seconds, and players may show the wrong length
+until the job ends. Only `.mp4` and `.mov` output is affected. Not available with
+streaming or [segment processing](segments.md).
+
 ## Color LUT
 
 Apply a `.cube` color LUT (1D or 3D) to the output — for color grading or
@@ -33,17 +75,36 @@ matching a house look. Set it in the GUI's Encoding section or with
 `--lut path/to/look.cube`. The LUT is applied on the GPU just before
 encoding, so it costs almost nothing.
 
-## Custom encoder settings
+## Sharpening
 
-The **Encoder custom args** field (`--encoder-settings`) fine-tunes the
-hardware video encoder — quality level, bitrate caps, keyframe interval, and
-more. The main knob is `cq` (lower = better quality, bigger file):
+Restored video can look a little soft. **Sharpening** in the GUI's Encoding
+section (`--sharpen`) makes edges and fine detail crisper as the video is
+written, so you don't need a second pass through another tool.
 
 ```bash
-jasna --input in.mp4 --output out.mkv --encoder-settings "cq=22"
+jasna --input in.mp4 --output out.mkv --sharpen 0.5
 ```
 
-Every accepted key for every codec is documented in the
+`0` turns it off, `0.2`–`0.5` is a gentle boost, and `1` is the strongest and
+can look harsh. A sharper picture needs a bigger file, so if the result looks
+worse rather than better, lower the CQ value as well. The effect is not shown
+in the preview.
+
+## Encoder quality and custom settings
+
+Use the GUI's **CQ** control or `--cq` for encoder quality. The displayed or
+entered number is passed to the encoder unchanged; lower means better quality
+and a bigger file. Jasna also limits output size, so nearby CQ values can give
+the same result when that limit is reached:
+
+```bash
+jasna --input in.mp4 --output out.mkv --cq 22
+```
+
+The **Encoder custom args** field (`--encoder-settings`) is for other advanced
+options such as bitrate caps and keyframe intervals. CQ aliases are rejected in
+the GUI custom-args field so the CQ control always matches what the encoder
+receives. Every accepted key, native range, and default is documented in the
 [CLI reference](cli.md#encoding).
 
 ## Post-export actions
@@ -56,3 +117,18 @@ Post-export section or via CLI:
 jasna --input input.mp4 --output output.mkv --post-export-action shutdown
 jasna --input folder_in --output folder_out --post-export-action command --post-export-command "echo done"
 ```
+
+To run a command after every successful video instead, fill **Command after
+each video** or use `--post-export-video-command`. Jasna waits for it to finish;
+if it fails, that video is marked as failed. The path placeholders are already
+quoted:
+
+```bash
+jasna --input folder_in --output folder_out --post-export-video-command "ffmpeg -i {output} -map 0 -map_metadata 0 -map_chapters 0 -c copy -movflags +faststart {output_dir}/{output_stem}_remuxed{output_suffix}"
+```
+
+Available placeholders are `{input}`, `{output}`, `{output_dir}`,
+`{output_stem}`, and `{output_suffix}`. The example keeps the original output;
+use a script with a temporary file if you want to replace it safely. `ffmpeg`
+must be on `PATH`, or replace it with its full path. The command's working
+folder is the output folder.

@@ -6,12 +6,18 @@ import os
 import subprocess
 from dataclasses import dataclass
 from fractions import Fraction
+from io import BytesIO
 from pathlib import Path
 
 import av
 
+from jasna.accelerator import AcceleratorVendor
 from jasna.media import VideoMetadata, resolve_video_start_pts
 from jasna.media.audio_utils import needs_audio_reencode
+from jasna.media.container_utils import (
+    is_mov_chapter_stream,
+    subtitle_transcode_codec,
+)
 from jasna.os_utils import find_executable, resolve_executable, subprocess_no_window_kwargs
 from jasna.segments import SegmentRange, normalize_segments
 
@@ -24,6 +30,11 @@ H264_SMART_PROFILES = {
     "constrained baseline": "baseline",
     "main": "main",
     "high": "high",
+}
+_AMF_H264_SMART_PROFILES = {
+    **H264_SMART_PROFILES,
+    "baseline": "constrained_baseline",
+    "constrained baseline": "constrained_baseline",
 }
 
 
@@ -121,7 +132,7 @@ def validate_smart_render(
     if field_order not in {"", "unknown", "progressive"}:
         raise SmartRenderCompatibilityError("Smart rendering currently requires progressive video")
     if input_codec == "h264" and metadata.is_10bit:
-        raise SmartRenderCompatibilityError("10-bit H.264 smart rendering is not supported by this NVENC path")
+        raise SmartRenderCompatibilityError("10-bit H.264 smart rendering is not supported")
     if input_codec == "h264" and str(metadata.profile or "").strip().lower() not in H264_SMART_PROFILES:
         raise SmartRenderCompatibilityError(
             f"Smart rendering cannot match H.264 profile {metadata.profile!r}"
@@ -166,11 +177,51 @@ def _source_gop_size(index: KeyframeIndex, video_fps: Fraction) -> int | None:
     return max(1, round(max(intervals) * index.time_base * video_fps))
 
 
+def _nvenc_h264_settings(
+    profile: str,
+    index: KeyframeIndex,
+) -> dict[str, object]:
+    return {
+        "profile": H264_SMART_PROFILES[profile],
+        "bf": index.max_b_frames,
+        "b_ref_mode": (
+            "middle"
+            if index.uses_b_references and index.max_b_frames >= 2
+            else "disabled"
+        ),
+    }
+
+
+def _amf_h264_settings(
+    profile: str,
+    index: KeyframeIndex,
+) -> dict[str, object]:
+    if index.max_b_frames > 3:
+        raise SmartRenderCompatibilityError(
+            "AMF H.264 smart rendering supports at most 3 consecutive B-frames; "
+            f"source uses {index.max_b_frames}"
+        )
+    return {
+        "profile": _AMF_H264_SMART_PROFILES[profile],
+        "bf": index.max_b_frames,
+        "bf_ref": int(index.uses_b_references and index.max_b_frames >= 2),
+        "pa_adaptive_mini_gop": 0,
+    }
+
+
+_H264_SETTINGS_BY_VENDOR = {
+    AcceleratorVendor.NVIDIA: _nvenc_h264_settings,
+    AcceleratorVendor.AMD: _amf_h264_settings,
+}
+
+
 def resolve_smart_encoder_settings(
     codec: str,
     metadata: VideoMetadata,
     index: KeyframeIndex,
     settings: dict[str, object],
+    *,
+    vendor: AcceleratorVendor,
 ) -> dict[str, object]:
     resolved = dict(settings)
     source_gop_size = _source_gop_size(index, metadata.video_fps_exact)
@@ -185,13 +236,13 @@ def resolve_smart_encoder_settings(
         raise SmartRenderCompatibilityError(
             f"Smart rendering cannot match H.264 profile {metadata.profile!r}"
         )
-    resolved["profile"] = H264_SMART_PROFILES[profile]
-    resolved["bf"] = index.max_b_frames
-    resolved["b_ref_mode"] = (
-        "middle"
-        if index.uses_b_references and index.max_b_frames >= 2
-        else "disabled"
-    )
+    try:
+        h264_settings = _H264_SETTINGS_BY_VENDOR[vendor](profile, index)
+    except KeyError as exc:
+        raise SmartRenderCompatibilityError(
+            f"Smart rendering is not supported on {vendor.value} encoders"
+        ) from exc
+    resolved.update(h264_settings)
     return resolved
 
 
@@ -497,26 +548,114 @@ def mux_final_output(
     codec: str,
 ) -> None:
     temporary = destination.with_name(f".{destination.stem}.smart-render{destination.suffix}")
+    output_format = {
+        ".mkv": "matroska",
+        ".mov": "mov",
+        ".mp4": "mp4",
+    }[destination.suffix.lower()]
+    with av.open(BytesIO(), "w", format=output_format) as probe:
+        supported_codecs = probe.supported_codecs
+
     args = [
         "-i", str(video),
         "-i", str(source),
         "-map", "0:v:0",
-        "-map", "1:a?",
-        "-map_metadata", "1",
-        "-map_metadata:s:v:0", "1:s:v:0",
-        "-c:v", "copy",
     ]
     with av.open(str(source)) as container:
-        audio_streams = list(container.streams.audio)
+        primary_video_index = container.streams.video[0].index
+        copied_streams = []
+        transcoded_subtitles = {}
+        source_formats = set(container.format.name.split(","))
+        source_chapters = container.chapters()
+        for stream in container.streams:
+            if stream.index == primary_video_index:
+                continue
+            if is_mov_chapter_stream(
+                stream,
+                source_formats=source_formats,
+                chapters=source_chapters,
+            ):
+                continue
+            if stream.type == "audio":
+                copied_streams.append(stream)
+                continue
+            if stream.type == "attachment":
+                if output_format == "matroska":
+                    copied_streams.append(stream)
+                else:
+                    log.warning(
+                        "Skipping attachment stream %s: %s output does not support attachments",
+                        stream.index,
+                        destination.suffix,
+                    )
+                continue
+            codec_name = (
+                stream.codec_context.name
+                if stream.codec_context is not None
+                else None
+            )
+            same_container_family = output_format in source_formats
+            if codec_name in supported_codecs or (
+                stream.type == "data" and same_container_family
+            ):
+                copied_streams.append(stream)
+                continue
+            transcode_codec = subtitle_transcode_codec(
+                codec_name,
+                output_formats={output_format},
+                supported_codecs=supported_codecs,
+            )
+            if stream.type == "subtitle" and transcode_codec is not None:
+                copied_streams.append(stream)
+                transcoded_subtitles[stream.index] = transcode_codec
+                log.info(
+                    "re-encoding subtitle %s -> %s for %s",
+                    codec_name,
+                    transcode_codec,
+                    destination.suffix,
+                )
+                continue
+            log.warning(
+                "Skipping %s stream %s: %s output does not support %s",
+                stream.type,
+                stream.index,
+                destination.suffix,
+                codec_name or "codec-less streams",
+            )
+
+        for stream in copied_streams:
+            args += ["-map", f"1:{stream.index}"]
+
+        args += [
+            "-map_metadata", "1",
+            "-map_metadata:s:v:0", "1:s:v:0",
+            "-map_chapters", "1",
+            "-c", "copy",
+        ]
+        for output_index, stream in enumerate(copied_streams, start=1):
+            args += [
+                f"-map_metadata:s:{output_index}",
+                f"1:s:{stream.index}",
+            ]
+        audio_streams = [
+            stream for stream in copied_streams if stream.type == "audio"
+        ]
         for output_index, stream in enumerate(audio_streams):
             name = stream.codec_context.name
             if needs_audio_reencode(name, destination.suffix):
                 args += [f"-c:a:{output_index}", "aac", f"-b:a:{output_index}", "256k"]
             else:
                 args += [f"-c:a:{output_index}", "copy"]
+        subtitle_streams = [
+            stream for stream in copied_streams if stream.type == "subtitle"
+        ]
+        for output_index, stream in enumerate(subtitle_streams):
+            transcode_codec = transcoded_subtitles.get(stream.index)
+            if transcode_codec is not None:
+                args += [f"-c:s:{output_index}", transcode_codec]
     if destination.suffix.lower() in {".mp4", ".mov"}:
         tag = {"h264": "avc3", "hevc": "hev1", "av1": "av01"}[codec]
-        args += ["-tag:v", tag, "-movflags", "+faststart"]
+        args += ["-tag:v:0", tag, "-movflags", "+faststart"]
     args.append(str(temporary))
     try:
         _run_ffmpeg(args, purpose=f"mux smart-render output {destination.name}")

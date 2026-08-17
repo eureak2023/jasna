@@ -4,15 +4,29 @@
 
 检测模型负责在每一帧中找到马赛克。
 
-- **使用最新的 RF-DETR 模型**（`rfdetr-v5`）— 它是默认值，也是综合
-  表现最好的选择。
+- **使用最新的 RF-DETR 模型**（`rfdetr-v6`）— 它是默认值、速度快，也是综合
+  表现最好的选择。已随 Jasna 内置。
+- **`rfdetr-v6-large`** 是质量更高、速度更慢的变体，4K 视频可能更适合用它。
+  它是可选的单独下载，
+  请按显卡选择对应文件，放入 `model_weights/`，Jasna 会自动检测：
+  - NVIDIA：
+    [rfdetr-v6-large.onnx](https://github.com/Kruk2/jasna/releases/download/0.1/rfdetr-v6-large.onnx)
+  - AMD：
+    [rfdetr-v6-large.pt](https://github.com/Kruk2/jasna/releases/download/0.1/rfdetr-v6-large.pt)
 - **Lada YOLO** 模型在 2D 动画上可能效果更好。
-- **zelefans-vr-yolo-v2**（已内置）在 VR180 视频上可能更准确。
-- **在 AMD 上**，RF-DETR 非常慢（在 Windows 上甚至只能用 CPU 运行）—
-  除非特别需要 RF-DETR，否则请改用 `lada-yolo-v4`。
+- **rfdetr-vr-v1**（已内置）是用于 VR180 的 RF-DETR 检测模型，最适合 VR180 视频。
+- **zelefans-vr-yolo-v2**（可选下载）是 VR180 的备用检测模型。
+- **在 AMD 上**，RF-DETR 在显卡上运行，使用 `.pt` 模型文件（NVIDIA 使用
+  `.onnx`）。它比在 NVIDIA 上慢，若速度比检测质量更重要，请选择
+  `lada-yolo-v4`。
+
+每个模型默认应用其推荐的检测阈值（`rfdetr-v6`：0.35，`rfdetr-v6-large`：0.40）；
+可用 `--detection-score-threshold` 覆盖。
+
+旧版 `rfdetr-v5` 模型仍受支持。
 
 ```bash
-jasna --input input.mp4 --output output.mkv --detection-model rfdetr-v5
+jasna --input input.mp4 --output output.mkv --detection-model rfdetr-v6
 ```
 
 你也可以在[区间编辑器](segments.md)中为每个视频单独设置不同的检测模型。

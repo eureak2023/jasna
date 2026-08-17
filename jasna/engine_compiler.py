@@ -24,7 +24,6 @@ class EngineCompilationRequest:
 
     basicvsrpp: bool = False
     basicvsrpp_model_path: str = ""
-    basicvsrpp_max_clip_size: int = 60
 
     detection: bool = False
     detection_model_name: str = ""
@@ -46,9 +45,9 @@ class EngineCompilationResult:
     use_basicvsrpp_tensorrt: bool = False
 
 
-def _basicvsrpp_engines_exist(model_path: str, fp16: bool, max_clip_size: int) -> bool:
+def _basicvsrpp_engines_exist(model_path: str, fp16: bool) -> bool:
     from jasna.engine_paths import all_basicvsrpp_sub_engines_exist
-    return all_basicvsrpp_sub_engines_exist(model_path, fp16, max_clip_size)
+    return all_basicvsrpp_sub_engines_exist(model_path, fp16)
 
 
 def _detection_engine_exists(
@@ -61,26 +60,16 @@ def _detection_engine_exists(
     import torch
 
     from jasna.accelerator import is_amd_device
-    from jasna.mosaic.detection_registry import is_rfdetr_model, is_yolo_model
+    from jasna.mosaic.detection_registry import (
+        is_rfdetr_model,
+        is_yolo_model,
+        rfdetr_model_config,
+    )
 
     resolved_device = torch.device(device)
     if is_amd_device(resolved_device):
-        if is_rfdetr_model(detection_model_name):
-            from jasna.mosaic.migraphx_runner import (
-                migraphx_cache_is_ready,
-                migraphx_provider_available,
-            )
-
-            if not migraphx_provider_available():
-                # Windows AMD uses standard ONNX Runtime's CPU provider and has
-                # no compiled MIGraphX cache artifact.
-                return True
-            return migraphx_cache_is_ready(
-                Path(detection_model_path),
-                resolved_device,
-                fp16=fp16,
-            )
-        # YOLO runs through PyTorch on AMD and has no compiled engine artifact.
+        # AMD runs both RF-DETR (rfdetr torch model) and YOLO through PyTorch;
+        # there is no compiled engine artifact to check for.
         return True
 
     from jasna.engine_paths import (
@@ -89,7 +78,13 @@ def _detection_engine_exists(
     )
 
     if is_rfdetr_model(detection_model_name):
-        return get_onnx_tensorrt_engine_path(detection_model_path, batch_size=batch_size, fp16=fp16).exists()
+        config = rfdetr_model_config(detection_model_name)
+        return get_onnx_tensorrt_engine_path(
+            detection_model_path,
+            batch_size=config.engine_batch_size(batch_size),
+            fp16=fp16,
+            dynamic_batch=config.dynamic_batch,
+        ).exists()
     if is_yolo_model(detection_model_name):
         return get_yolo_tensorrt_engine_path(detection_model_path, fp16=fp16).exists()
     return True
@@ -134,7 +129,7 @@ def ensure_engines_compiled(
         raise RuntimeError("unet-4x currently requires the NVIDIA TensorRT build")
 
     need_basicvsrpp = nvidia and req.basicvsrpp and req.fp16 and not _basicvsrpp_engines_exist(
-        req.basicvsrpp_model_path, req.fp16, req.basicvsrpp_max_clip_size
+        req.basicvsrpp_model_path, req.fp16
     )
     need_detection = req.detection and not _detection_engine_exists(
         req.detection_model_name,
@@ -206,7 +201,7 @@ def ensure_engines_compiled(
 
     if req.basicvsrpp and nvidia:
         result.use_basicvsrpp_tensorrt = _basicvsrpp_engines_exist(
-            req.basicvsrpp_model_path, req.fp16, req.basicvsrpp_max_clip_size
+            req.basicvsrpp_model_path, req.fp16
         )
 
     return result
@@ -233,15 +228,14 @@ def _subprocess_compile(req: EngineCompilationRequest) -> None:
     nvidia = is_nvidia_device(device)
 
     if nvidia and req.basicvsrpp and req.fp16 and not _basicvsrpp_engines_exist(
-        req.basicvsrpp_model_path, req.fp16, req.basicvsrpp_max_clip_size
+        req.basicvsrpp_model_path, req.fp16
     ):
         from jasna.restorer.basicvrspp_tenorrt_compilation import compile_mosaic_restoration_model
-        print(f"Compiling BasicVSR++ sub-engines (max_clip_size={req.basicvsrpp_max_clip_size})...")
+        print("Compiling BasicVSR++ sub-engines...")
         compile_mosaic_restoration_model(
             mosaic_restoration_model_path=req.basicvsrpp_model_path,
             device=device,
             fp16=req.fp16,
-            max_clip_size=req.basicvsrpp_max_clip_size,
         )
         print("BasicVSR++ sub-engines compiled.")
 

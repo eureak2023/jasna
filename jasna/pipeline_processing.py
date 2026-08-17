@@ -11,8 +11,8 @@ from jasna.crop_buffer import CropBuffer, RawCrop, extract_crop
 from jasna.mosaic.detections import Detections
 from jasna.pipeline_items import ClipRestoreItem, FrameMeta
 from jasna.pipeline_overlap import compute_crossfade_weights, compute_keep_range, compute_overlap_and_tail_indices, compute_parent_crossfade_weights
-from jasna.tensor_utils import pad_batch_with_last
 from jasna.tracking.clip_tracker import ClipTracker, EndedClip
+from jasna.tracking.scene_detector import SceneCutDetector
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +33,7 @@ def _process_ended_clips(
     crop_buffers: dict[int, CropBuffer],
     clip_queue: Queue[ClipRestoreItem | object],
     frame_shape: tuple[int, int],
+    min_detection_duration: int = 0,
 ) -> None:
     bf = min(int(blend_frames), int(discard_margin)) if discard_margin > 0 else 0
     if bf > 0 and discard_margin > 0:
@@ -44,6 +45,19 @@ def _process_ended_clips(
         crop_buf = crop_buffers.pop(clip.track_id, None)
         if crop_buf is None:
             raise RuntimeError(f"missing CropBuffer for clip {clip.track_id}")
+
+        if ended_clip.trimmed_frame_indices:
+            del crop_buf.crops[clip.frame_count:]
+            blend_buffer.remove_pending_clip(list(ended_clip.trimmed_frame_indices), clip.track_id)
+
+        if (
+            min_detection_duration > 1
+            and clip.frame_count < min_detection_duration
+            and not ended_clip.split_due_to_max_size
+            and not clip.is_continuation
+        ):
+            blend_buffer.remove_pending_clip(clip.frame_indices(), clip.track_id)
+            continue
 
         if ended_clip.split_due_to_max_size and discard_margin > 0:
             child_id = ended_clip.continuation_track_id
@@ -108,7 +122,6 @@ def process_frame_batch(
     frames: torch.Tensor,
     pts_list: list[int],
     start_frame_idx: int,
-    batch_size: int,
     target_hw: tuple[int, int],
     detections_fn,
     tracker: ClipTracker,
@@ -119,15 +132,17 @@ def process_frame_batch(
     discard_margin: int,
     blend_frames: int = 0,
     crop_eye_width: int | None = None,
+    min_detection_duration: int = 0,
+    scene_detector: SceneCutDetector | None = None,
+    vr_projector=None,
 ) -> BatchProcessResult:
     effective_bs = len(pts_list)
     if effective_bs == 0:
         return BatchProcessResult(next_frame_idx=int(start_frame_idx), clips_emitted=0)
 
     frames_eff = frames[:effective_bs]
-    frames_in = pad_batch_with_last(frames_eff, batch_size=int(batch_size))
-
-    detections: Detections = detections_fn(frames_in, target_hw=target_hw)
+    scene_cuts = scene_detector.find_cuts(frames_eff) if scene_detector is not None else frozenset()
+    detections: Detections = detections_fn(frames_eff, target_hw=target_hw)
     _, frame_h, frame_w = frames_eff[0].shape
 
     clips_emitted = 0
@@ -139,7 +154,9 @@ def process_frame_batch(
         valid_boxes = detections.boxes_xyxy[i]
         valid_masks = detections.masks[i]
 
+        scene_cut_clips = tracker.flush() if i in scene_cuts else []
         ended_clips, active_track_ids = tracker.update(current_frame_idx, valid_boxes, valid_masks)
+        ended_clips = scene_cut_clips + ended_clips
 
         blend_buffer.register_frame(current_frame_idx, active_track_ids)
         metadata_queue.put(FrameMeta(frame_idx=current_frame_idx, pts=pts))
@@ -151,13 +168,8 @@ def process_frame_batch(
             if track_id not in crop_buffers:
                 crop_buffers[track_id] = CropBuffer(track_id=track_id, start_frame=clip.start_frame)
             bbox = clip.bboxes[-1]
-            x_bounds = _eye_bounds(bbox, crop_eye_width, frame_w)
-            raw_crop = extract_crop(
-                frame,
-                bbox,
-                frame_h,
-                frame_w,
-                x_bounds=x_bounds,
+            raw_crop = _extract_region_crop(
+                frame, bbox, frame_h, frame_w, crop_eye_width, vr_projector
             )
             crop_buffers[track_id].add(raw_crop)
 
@@ -167,13 +179,8 @@ def process_frame_batch(
                 crop_buffers[tid] = CropBuffer(track_id=tid, start_frame=ec.clip.start_frame)
             if crop_buffers[tid].frame_count < ec.clip.frame_count:
                 bbox = ec.clip.bboxes[-1]
-                x_bounds = _eye_bounds(bbox, crop_eye_width, frame_w)
-                raw_crop = extract_crop(
-                    frame,
-                    bbox,
-                    frame_h,
-                    frame_w,
-                    x_bounds=x_bounds,
+                raw_crop = _extract_region_crop(
+                    frame, bbox, frame_h, frame_w, crop_eye_width, vr_projector
                 )
                 crop_buffers[tid].add(raw_crop)
 
@@ -188,12 +195,29 @@ def process_frame_batch(
             crop_buffers=crop_buffers,
             clip_queue=clip_queue,
             frame_shape=(frame_h, frame_w),
+            min_detection_duration=int(min_detection_duration),
         )
 
     return BatchProcessResult(
         next_frame_idx=int(start_frame_idx) + effective_bs,
         clips_emitted=clips_emitted,
     )
+
+
+def _extract_region_crop(
+    frame: torch.Tensor,
+    bbox,
+    frame_h: int,
+    frame_w: int,
+    crop_eye_width: int | None,
+    vr_projector,
+) -> RawCrop:
+    x_bounds = _eye_bounds(bbox, crop_eye_width, frame_w)
+    if vr_projector is not None:
+        return vr_projector.extract_region_crop(
+            frame, bbox, frame_h, frame_w, x_bounds=x_bounds
+        )
+    return extract_crop(frame, bbox, frame_h, frame_w, x_bounds=x_bounds)
 
 
 def _eye_bounds(
@@ -221,6 +245,7 @@ def finalize_processing(
     frame_shape: tuple[int, int],
     discard_margin: int,
     blend_frames: int = 0,
+    min_detection_duration: int = 0,
 ) -> None:
     ended_clips = tracker.flush()
     _process_ended_clips(
@@ -232,4 +257,5 @@ def finalize_processing(
         crop_buffers=crop_buffers,
         clip_queue=clip_queue,
         frame_shape=frame_shape,
+        min_detection_duration=int(min_detection_duration),
     )

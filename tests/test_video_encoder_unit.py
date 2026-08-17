@@ -9,28 +9,14 @@ from fractions import Fraction
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import av
 import pytest
 import torch
 from av.video.reformatter import Colorspace as AvColorspace, ColorRange as AvColorRange
 
 import jasna.media.video_encoder as video_encoder_module
+from jasna.accelerator import AcceleratorVendor
 from jasna.media import VideoMetadata
-from jasna.media.rgb_to_nv12 import (
-    chw_rgb_to_nv12_bt2020_full,
-    chw_rgb_to_nv12_bt2020_limited,
-    chw_rgb_to_nv12_bt601_full,
-    chw_rgb_to_nv12_bt601_limited,
-    chw_rgb_to_nv12_bt709_full,
-    chw_rgb_to_nv12_bt709_limited,
-)
-from jasna.media.rgb_to_p010 import (
-    chw_rgb_to_p010_bt2020_full,
-    chw_rgb_to_p010_bt2020_limited,
-    chw_rgb_to_p010_bt601_full,
-    chw_rgb_to_p010_bt601_limited,
-    chw_rgb_to_p010_bt709_full,
-    chw_rgb_to_p010_bt709_limited,
-)
 from jasna.media.video_encoder import (
     DEFAULT_AV1_ENCODER_OPTIONS,
     DEFAULT_ENCODER_OPTIONS,
@@ -38,6 +24,8 @@ from jasna.media.video_encoder import (
     ENCODER_SPECS,
     _CODEC_MAP,
     _align_yuv_pitch,
+    _mov_container_options,
+    _normalized_audio_layout,
     NvidiaVideoEncoder,
 )
 
@@ -73,13 +61,13 @@ def _make_encoder(tmp_path, encoder_settings=None, codec="hevc", **meta_override
     )
 
 
-# Pre-PR hevc_nvenc configuration; the HEVC path must never drift from it.
+# Measured hevc_nvenc configuration; the HEVC path must never drift from it.
 _HEVC_OPTIONS_SNAPSHOT = {
     "preset": "p5",
     "tune": "hq",
     "profile": "main10",
     "rc": "vbr",
-    "cq": "25",
+    "cq": "28",
     "qmin": "17",
     "qmax": "34",
     "nonref_p": "1",
@@ -108,14 +96,14 @@ class TestCodecSpecs:
     def test_h264_defaults_snapshot(self):
         expected = dict(_HEVC_OPTIONS_SNAPSHOT)
         expected["profile"] = "high"
-        expected["cq"] = "24"
+        expected["cq"] = "25"
         del expected["lookahead_level"]
         assert DEFAULT_H264_ENCODER_OPTIONS == expected
 
     def test_av1_defaults_snapshot(self):
         expected = dict(_HEVC_OPTIONS_SNAPSHOT)
         del expected["profile"]
-        expected["cq"] = "32"
+        expected["cq"] = "35"
         del expected["qmin"]
         del expected["qmax"]
         del expected["spatial_aq"]
@@ -126,7 +114,7 @@ class TestCodecSpecs:
         assert DEFAULT_AV1_ENCODER_OPTIONS == expected
 
     def test_av1_does_not_reuse_hevc_qp_scale(self):
-        assert DEFAULT_AV1_ENCODER_OPTIONS["cq"] == "32"
+        assert DEFAULT_AV1_ENCODER_OPTIONS["cq"] == "35"
         assert not {
             "qmin",
             "qmax",
@@ -142,6 +130,299 @@ class TestCodecSpecs:
         assert ENCODER_SPECS["h264"].ten_bit is False
         assert ENCODER_SPECS["av1"].frame_format == "p010le"
         assert ENCODER_SPECS["av1"].ten_bit is True
+
+    def test_nvenc_smart_fragment_options_are_unchanged(self):
+        for spec in ENCODER_SPECS.values():
+            assert dict(spec.smart_fragment_options) == {"forced-idr": "1"}
+
+
+class TestContainerOptions:
+    @pytest.mark.parametrize("suffix", [".mp4", ".MP4", ".mov"])
+    def test_faststart_by_default(self, suffix):
+        assert _mov_container_options(suffix, fmp4=False) == {"movflags": "+faststart"}
+
+    @pytest.mark.parametrize("suffix", [".mp4", ".MP4", ".mov"])
+    def test_fragmented_replaces_faststart(self, suffix):
+        assert _mov_container_options(suffix, fmp4=True) == {
+            "movflags": "+frag_keyframe+empty_moov"
+        }
+
+    @pytest.mark.parametrize("suffix", [".mkv", ".nut", ".ts"])
+    def test_other_containers_get_no_movflags(self, suffix):
+        assert _mov_container_options(suffix, fmp4=False) == {}
+        assert _mov_container_options(suffix, fmp4=True) == {}
+
+    def test_fmp4_defaults_off_and_leaves_encoder_options_alone(self, tmp_path):
+        default = _make_encoder(tmp_path)
+        fragmented = NvidiaVideoEncoder(
+            file=str(tmp_path / "result.mp4"),
+            device=torch.device("cuda:0"),
+            metadata=_fake_metadata(),
+            codec="hevc",
+            encoder_settings={},
+            fmp4=True,
+        )
+        assert default.fmp4 is False
+        assert fragmented.fmp4 is True
+        assert fragmented.encoder_options == default.encoder_options
+
+
+def test_normalizes_count_only_stereo_layout():
+    layout = av.AudioLayout("2 channels")
+
+    normalized = _normalized_audio_layout(layout)
+
+    assert normalized.name == "stereo"
+    assert [channel.name for channel in normalized.channels] == ["FL", "FR"]
+
+
+@pytest.mark.parametrize("name", ["stereo", "5.1"])
+def test_preserves_named_audio_layout(name):
+    layout = av.AudioLayout(name)
+
+    assert _normalized_audio_layout(layout) is layout
+
+
+def _source_stream(
+    index: int,
+    stream_type: str,
+    codec_name: str | None,
+    *,
+    metadata: dict[str, str] | None = None,
+    disposition: int = 0,
+):
+    codec_context = None
+    if codec_name is not None:
+        codec_context = SimpleNamespace(
+            name=codec_name,
+            sample_rate=48_000,
+            layout=av.AudioLayout("stereo"),
+        )
+    return SimpleNamespace(
+        index=index,
+        type=stream_type,
+        codec_context=codec_context,
+        metadata=dict(metadata or {}),
+        disposition=disposition,
+    )
+
+
+class TestSourceContainerPreservation:
+    def test_copies_container_chapters_and_primary_video_metadata(self, tmp_path):
+        encoder = _make_encoder(tmp_path)
+        chapters = [
+            {
+                "id": 1,
+                "start": 0,
+                "end": 2_000,
+                "time_base": Fraction(1, 1_000),
+                "metadata": {"title": "Opening"},
+            }
+        ]
+        encoder._src = SimpleNamespace(
+            metadata={"title": "Source title"},
+            chapters=MagicMock(return_value=chapters),
+        )
+        encoder.dst = SimpleNamespace(metadata={}, set_chapters=MagicMock())
+        input_video = _source_stream(
+            0,
+            "video",
+            "h264",
+            metadata={"language": "jpn", "title": "Main video"},
+            disposition=3,
+        )
+        output_video = SimpleNamespace(metadata={}, disposition=0)
+
+        encoder._copy_source_metadata(input_video, output_video)
+
+        assert encoder.dst.metadata == {"title": "Source title"}
+        encoder.dst.set_chapters.assert_called_once_with(chapters)
+        assert output_video.metadata == {
+            "language": "jpn",
+            "title": "Main video",
+        }
+        assert output_video.disposition == 3
+
+    def test_smart_fragment_does_not_copy_chapters(self, tmp_path):
+        encoder = NvidiaVideoEncoder(
+            file=str(tmp_path / "part.nut"),
+            device=torch.device("cuda:0"),
+            metadata=_fake_metadata(),
+            codec="hevc",
+            encoder_settings={},
+            smart_fragment=True,
+            mux_audio=False,
+        )
+        encoder._src = SimpleNamespace(
+            metadata={"title": "Source title"},
+            chapters=MagicMock(return_value=[{"id": 1}]),
+        )
+        encoder.dst = SimpleNamespace(metadata={}, set_chapters=MagicMock())
+        input_video = _source_stream(0, "video", "h264")
+        output_video = SimpleNamespace(metadata={}, disposition=0)
+
+        encoder._copy_source_metadata(input_video, output_video)
+
+        encoder.dst.set_chapters.assert_not_called()
+
+    def test_sets_up_all_compatible_source_streams(self, tmp_path):
+        encoder = _make_encoder(tmp_path)
+        primary_video = _source_stream(0, "video", "h264")
+        audio = _source_stream(
+            1,
+            "audio",
+            "aac",
+            metadata={"language": "eng"},
+            disposition=1,
+        )
+        subtitle = _source_stream(
+            2,
+            "subtitle",
+            "ass",
+            metadata={"language": "pol", "title": "Signs"},
+            disposition=2,
+        )
+        alternate_video = _source_stream(
+            3,
+            "video",
+            "h264",
+            metadata={"title": "Alternate angle"},
+        )
+        attachment = _source_stream(
+            4,
+            "attachment",
+            None,
+            metadata={"filename": "font.ttf", "mimetype": "font/ttf"},
+        )
+        packet_streams = [audio, subtitle, alternate_video]
+        demux_result = iter(())
+        encoder._src = SimpleNamespace(
+            streams=[primary_video, audio, subtitle, alternate_video, attachment],
+            format=SimpleNamespace(name="matroska"),
+            demux=MagicMock(return_value=demux_result),
+        )
+        outputs: dict[int, SimpleNamespace] = {}
+
+        def add_stream_from_template(stream, **_kwargs):
+            output = SimpleNamespace(metadata={}, disposition=0)
+            outputs[stream.index] = output
+            return output
+
+        encoder.dst = SimpleNamespace(
+            format=SimpleNamespace(name="matroska"),
+            add_stream=MagicMock(),
+            add_stream_from_template=MagicMock(side_effect=add_stream_from_template),
+        )
+
+        encoder._setup_source_streams(primary_video)
+
+        assert set(encoder._source_pipes) == {1, 2, 3}
+        encoder._src.demux.assert_called_once_with(packet_streams)
+        assert encoder._source_iter is demux_result
+        assert outputs[1].metadata == {"language": "eng"}
+        assert outputs[1].disposition == 1
+        assert outputs[2].metadata == {"language": "pol", "title": "Signs"}
+        assert outputs[2].disposition == 2
+        assert outputs[3].metadata == {"title": "Alternate angle"}
+        assert 4 in outputs
+
+    def test_skips_streams_the_output_container_cannot_copy(
+        self, tmp_path, caplog
+    ):
+        encoder = _make_encoder(tmp_path)
+        primary_video = _source_stream(0, "video", "h264")
+        subtitle = _source_stream(1, "subtitle", "pgssub")
+        attachment = _source_stream(2, "attachment", None)
+        encoder._src = SimpleNamespace(
+            streams=[primary_video, subtitle, attachment],
+            format=SimpleNamespace(name="matroska"),
+            demux=MagicMock(),
+        )
+        encoder.dst = SimpleNamespace(
+            format=SimpleNamespace(name="mp4"),
+            add_stream=MagicMock(),
+            add_stream_from_template=MagicMock(
+                side_effect=ValueError("mp4 does not support pgssub")
+            ),
+        )
+
+        encoder._setup_source_streams(primary_video)
+
+        assert encoder._source_pipes == {}
+        encoder._src.demux.assert_not_called()
+        assert "Skipping subtitle stream 1" in caplog.text
+        assert "Skipping attachment stream 2" in caplog.text
+
+    def test_transcodes_text_subtitle_when_container_cannot_copy(self, tmp_path):
+        encoder = _make_encoder(tmp_path)
+        encoder.output_path = tmp_path / "result.mp4"
+        primary_video = _source_stream(0, "video", "h264")
+        subtitle = _source_stream(
+            1,
+            "subtitle",
+            "ass",
+            metadata={"language": "pol", "title": "Signs"},
+            disposition=3,
+        )
+        encoder._src = SimpleNamespace(
+            streams=[primary_video, subtitle],
+            format=SimpleNamespace(name="matroska"),
+            demux=MagicMock(return_value=iter(())),
+        )
+        output_codec = SimpleNamespace(
+            time_base=None,
+            subtitle_header=None,
+        )
+        output_subtitle = SimpleNamespace(
+            type="subtitle",
+            codec_context=output_codec,
+            time_base=None,
+            metadata={},
+            disposition=0,
+        )
+        encoder.dst = SimpleNamespace(
+            format=SimpleNamespace(name="mp4"),
+            supported_codecs={"mov_text"},
+            add_stream=MagicMock(return_value=output_subtitle),
+            add_stream_from_template=MagicMock(
+                side_effect=ValueError("mp4 does not support ass")
+            ),
+        )
+
+        encoder._setup_source_streams(primary_video)
+
+        encoder.dst.add_stream.assert_called_once_with("mov_text")
+        assert encoder._source_pipes[1] == (
+            "subtitle_transcode",
+            output_subtitle,
+            None,
+        )
+        assert output_codec.subtitle_header == b""
+        assert output_subtitle.metadata == {"language": "pol", "title": "Signs"}
+        assert output_subtitle.disposition == 3
+
+    def test_does_not_copy_mp4_chapter_carrier_as_a_data_stream(self, tmp_path):
+        encoder = _make_encoder(tmp_path)
+        primary_video = _source_stream(0, "video", "h264")
+        chapter_carrier = _source_stream(1, "data", None)
+        chapter_carrier.name = "bin_data"
+        chapter_carrier.metadata["handler_name"] = "SubtitleHandler"
+        encoder._source_chapters = [{"id": 0}]
+        encoder._src = SimpleNamespace(
+            streams=[primary_video, chapter_carrier],
+            format=SimpleNamespace(name="mov,mp4,m4a,3gp,3g2,mj2"),
+            demux=MagicMock(),
+        )
+        encoder.dst = SimpleNamespace(
+            format=SimpleNamespace(name="mp4"),
+            add_stream=MagicMock(),
+            add_stream_from_template=MagicMock(),
+        )
+
+        encoder._setup_source_streams(primary_video)
+
+        encoder.dst.add_stream_from_template.assert_not_called()
+        encoder._src.demux.assert_not_called()
 
 
 class TestEncoderOptions:
@@ -229,6 +510,59 @@ class TestEncoderOptions:
         assert enc.encoder_options["maxrate"] == "10M"
         assert enc.encoder_options["preset"] == "p5"
 
+    def test_source_bitrate_adds_ceiling(self, tmp_path):
+        enc = _make_encoder(tmp_path, codec_name="hevc", video_bitrate=20_000_000)
+        assert enc.encoder_options["maxrate"] == "25000000"
+        assert enc.encoder_options["bufsize"] == "50000000"
+
+    def test_source_bitrate_ceiling_is_tighter_for_non_hevc(self, tmp_path):
+        enc = _make_encoder(tmp_path, codec_name="h264", video_bitrate=20_000_000)
+        assert enc.encoder_options["maxrate"] == "20000000"
+        assert enc.encoder_options["bufsize"] == "40000000"
+
+    def test_nvenc_h264_output_gets_two_x_ceiling(self, tmp_path):
+        enc = _make_encoder(
+            tmp_path,
+            codec="h264",
+            codec_name="h264",
+            video_bitrate=20_000_000,
+        )
+        assert enc.encoder_options["maxrate"] == "40000000"
+        assert enc.encoder_options["bufsize"] == "80000000"
+
+    def test_amf_h264_output_keeps_source_codec_ceiling(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            video_encoder_module,
+            "vendor_for_device",
+            lambda _device: AcceleratorVendor.AMD,
+        )
+        enc = _make_encoder(
+            tmp_path,
+            codec="h264",
+            codec_name="h264",
+            video_bitrate=20_000_000,
+        )
+        assert enc.encoder_options["maxrate"] == "20000000"
+        assert enc.encoder_options["bufsize"] == "40000000"
+
+    def test_no_ceiling_without_source_bitrate(self, tmp_path):
+        enc = _make_encoder(tmp_path, video_bitrate=0)
+        assert "maxrate" not in enc.encoder_options
+        assert "bufsize" not in enc.encoder_options
+
+    @pytest.mark.parametrize("codec", ["hevc", "h264"])
+    def test_explicit_maxrate_replaces_derived_ceiling(self, tmp_path, codec):
+        enc = _make_encoder(
+            tmp_path,
+            codec=codec,
+            encoder_settings={"maxrate": "3000000"},
+            codec_name="hevc",
+            video_bitrate=20_000_000,
+        )
+        assert enc.encoder_options["maxrate"] == "3000000"
+        # The derived buffer must not survive a user-chosen ceiling.
+        assert "bufsize" not in enc.encoder_options
+
     def test_unsupported_codec_raises(self, tmp_path):
         with pytest.raises(ValueError, match="Unsupported codec"):
             NvidiaVideoEncoder(
@@ -273,6 +607,126 @@ class TestEncoderOptions:
         assert enc._options_validated
 
 
+class _StopEncode(Exception):
+    """Cuts _encode_frame short once the encoder input has been captured."""
+
+
+class TestSharpening:
+    def test_no_sharpener_by_default(self, tmp_path):
+        assert _make_encoder(tmp_path)._cas is None
+
+    def test_sharpener_built_when_requested(self, tmp_path):
+        enc = NvidiaVideoEncoder(
+            file=str(tmp_path / "result.mkv"),
+            device=torch.device("cuda:0"),
+            metadata=_fake_metadata(),
+            codec="hevc",
+            encoder_settings={},
+            sharpen_strength=0.4,
+        )
+        assert enc._cas is not None
+        assert enc._cas.weight_scale == pytest.approx(-1.0 / (16.0 - 12.0 * 0.4))
+
+    def test_sharpener_follows_the_encoder_bit_depth(self, tmp_path):
+        ten_bit = NvidiaVideoEncoder(
+            file=str(tmp_path / "a.mkv"),
+            device=torch.device("cuda:0"),
+            metadata=_fake_metadata(),
+            codec="hevc",
+            encoder_settings={},
+            sharpen_strength=0.4,
+        )
+        eight_bit = NvidiaVideoEncoder(
+            file=str(tmp_path / "b.nut"),
+            device=torch.device("cuda:0"),
+            metadata=_fake_metadata(is_10bit=False),
+            codec="hevc",
+            encoder_settings={},
+            sharpen_strength=0.4,
+            match_input_bit_depth=True,
+            smart_fragment=True,
+            mux_audio=False,
+        )
+        assert ten_bit._cas.ten_bit is True
+        assert ten_bit._cas.peak == 1023.0
+        assert eight_bit._cas.ten_bit is False
+        assert eight_bit._cas.peak == 255.0
+
+    def test_zero_strength_leaves_the_converted_frame_untouched(self, tmp_path, monkeypatch):
+        enc = _make_encoder(tmp_path, codec="h264")  # nv12, so planes stay uint8
+        packed = torch.arange(24, dtype=torch.uint8, device=enc.device).reshape(6, 4)
+        enc._converter = SimpleNamespace(
+            sample_dtype=torch.uint8,
+            uses_kernel=False,
+            convert_into=lambda frame, luma, chroma: (
+                luma.copy_(packed[:4]),
+                chroma.copy_(packed[4:]),
+            ),
+        )
+        enc.stream = SimpleNamespace(cuda_stream=1234, synchronize=lambda: None)
+        enc.metadata = _fake_metadata(video_height=4, video_width=4)
+        enc._cuda_ctx = None
+        seen = []
+
+        def capture(planes, **kwargs):
+            seen.append(planes)
+            raise _StopEncode
+
+        monkeypatch.setattr(
+            video_encoder_module, "stream_context", lambda _s: nullcontext()
+        )
+        monkeypatch.setattr(video_encoder_module, "_align_yuv_pitch", lambda p: p)
+        monkeypatch.setattr(video_encoder_module.av.VideoFrame, "from_dlpack", capture)
+
+        with pytest.raises(_StopEncode):
+            enc._encode_frame(torch.zeros(3, 4, 4), pts=0)
+
+        assert torch.equal(torch.cat(seen[0]), packed)
+
+    def test_sharpening_runs_before_pitch_alignment(self, tmp_path, monkeypatch):
+        enc = NvidiaVideoEncoder(
+            file=str(tmp_path / "result.mkv"),
+            device=torch.device("cuda:0"),
+            metadata=_fake_metadata(),
+            codec="hevc",
+            encoder_settings={},
+            sharpen_strength=0.4,
+        )
+        enc._converter = SimpleNamespace(
+            sample_dtype=torch.uint8,
+            uses_kernel=False,
+            convert_into=lambda frame, luma, chroma: None,
+        )
+        enc.stream = SimpleNamespace(cuda_stream=1234, synchronize=lambda: None)
+        enc.metadata = _fake_metadata(video_height=4, video_width=4)
+        enc._cuda_ctx = None
+        order = []
+        enc._cas = SimpleNamespace(
+            sharpen_into=lambda source, destination: order.append(
+                ("sharpen", destination.is_contiguous())
+            )
+        )
+
+        def align(packed):
+            order.append(("align", True))
+            return packed
+
+        def stop(*args, **kwargs):
+            raise _StopEncode
+
+        monkeypatch.setattr(
+            video_encoder_module, "stream_context", lambda _s: nullcontext()
+        )
+        monkeypatch.setattr(video_encoder_module, "_align_yuv_pitch", align)
+        monkeypatch.setattr(video_encoder_module.av.VideoFrame, "from_dlpack", stop)
+
+        with pytest.raises(_StopEncode):
+            enc._encode_frame(torch.zeros(3, 4, 4), pts=0)
+
+        assert [step for step, _ in order] == ["sharpen", "align"]
+        assert order[0][1] is True  # sharpening sees a contiguous plane
+
+
 class TestColorHandling:
     def test_unsupported_color_range_raises(self, tmp_path):
         with pytest.raises(ValueError, match="Unsupported color space or color range"):
@@ -281,33 +735,33 @@ class TestColorHandling:
     @pytest.mark.parametrize(
         ("color_space", "color_range", "expected"),
         [
-            (AvColorspace.ITU709, AvColorRange.MPEG, chw_rgb_to_p010_bt709_limited),
-            (AvColorspace.ITU709, AvColorRange.JPEG, chw_rgb_to_p010_bt709_full),
-            (AvColorspace.ITU601, AvColorRange.MPEG, chw_rgb_to_p010_bt601_limited),
-            (AvColorspace.ITU601, AvColorRange.JPEG, chw_rgb_to_p010_bt601_full),
-            (AvColorspace.BT2020, AvColorRange.MPEG, chw_rgb_to_p010_bt2020_limited),
-            (AvColorspace.BT2020, AvColorRange.JPEG, chw_rgb_to_p010_bt2020_full),
+            (AvColorspace.ITU709, AvColorRange.MPEG, "p010_bt709_limited"),
+            (AvColorspace.ITU709, AvColorRange.JPEG, "p010_bt709_full"),
+            (AvColorspace.ITU601, AvColorRange.MPEG, "p010_bt601_limited"),
+            (AvColorspace.ITU601, AvColorRange.JPEG, "p010_bt601_full"),
+            (AvColorspace.BT2020, AvColorRange.MPEG, "p010_bt2020_limited"),
+            (AvColorspace.BT2020, AvColorRange.JPEG, "p010_bt2020_full"),
         ],
     )
     @pytest.mark.parametrize("codec", ["hevc", "av1"])
     def test_selects_p010_converter_for_hevc_and_av1(self, tmp_path, codec, color_space, color_range, expected):
         enc = _make_encoder(tmp_path, codec=codec, color_space=color_space, color_range=color_range)
-        assert enc._to_yuv is expected
+        assert enc._converter.variant == expected
 
     @pytest.mark.parametrize(
         ("color_space", "color_range", "expected"),
         [
-            (AvColorspace.ITU709, AvColorRange.MPEG, chw_rgb_to_nv12_bt709_limited),
-            (AvColorspace.ITU709, AvColorRange.JPEG, chw_rgb_to_nv12_bt709_full),
-            (AvColorspace.ITU601, AvColorRange.MPEG, chw_rgb_to_nv12_bt601_limited),
-            (AvColorspace.ITU601, AvColorRange.JPEG, chw_rgb_to_nv12_bt601_full),
-            (AvColorspace.BT2020, AvColorRange.MPEG, chw_rgb_to_nv12_bt2020_limited),
-            (AvColorspace.BT2020, AvColorRange.JPEG, chw_rgb_to_nv12_bt2020_full),
+            (AvColorspace.ITU709, AvColorRange.MPEG, "nv12_bt709_limited"),
+            (AvColorspace.ITU709, AvColorRange.JPEG, "nv12_bt709_full"),
+            (AvColorspace.ITU601, AvColorRange.MPEG, "nv12_bt601_limited"),
+            (AvColorspace.ITU601, AvColorRange.JPEG, "nv12_bt601_full"),
+            (AvColorspace.BT2020, AvColorRange.MPEG, "nv12_bt2020_limited"),
+            (AvColorspace.BT2020, AvColorRange.JPEG, "nv12_bt2020_full"),
         ],
     )
     def test_selects_nv12_converter_for_h264(self, tmp_path, color_space, color_range, expected):
         enc = _make_encoder(tmp_path, codec="h264", color_space=color_space, color_range=color_range)
-        assert enc._to_yuv is expected
+        assert enc._converter.variant == expected
 
     @pytest.mark.parametrize("codec", ["h264", "av1"])
     def test_unsupported_color_range_raises_for_new_codecs(self, tmp_path, codec):
@@ -320,6 +774,7 @@ def _buffered_encoder(tmp_path) -> NvidiaVideoEncoder:
     enc.pts_heap = []
     enc.frame_buffer = deque()
     enc.pts_set = set()
+    enc._last_emitted_pts = None
     enc._worker_error = None
     enc._encode_queue = MagicMock()
     enc._build_encode_item = MagicMock(side_effect=lambda frame, pts: (frame, pts, None))
@@ -368,12 +823,21 @@ class TestEncodeBuffer:
         else:
             assert aligned.data_ptr() != packed.data_ptr()
 
-    def test_from_dlpack_reuses_cuda_context_without_repeating_context_flags(self, tmp_path, monkeypatch):
-        enc = _make_encoder(tmp_path, codec="h264", video_width=2, video_height=2)
+    def test_from_dlpack_uses_shared_cuda_stream_without_host_sync(
+        self, tmp_path, monkeypatch
+    ):
+        enc = _make_encoder(tmp_path, codec="hevc", video_width=2, video_height=2)
+        # Force NVIDIA contracts even when the host GPU is AMD/ROCm.
+        enc.vendor = video_encoder_module.AcceleratorVendor.NVIDIA
         enc.stream = MagicMock()
+        enc.stream.cuda_stream = 1234
         enc._cuda_ctx = object()
         enc._lut_applier = None
-        enc._to_yuv = lambda frame: torch.zeros((3, 2), dtype=torch.uint8)
+        enc._converter = SimpleNamespace(
+            sample_dtype=torch.int16,
+            uses_kernel=False,
+            convert_into=lambda frame, luma, chroma: None,
+        )
         enc.out_stream = MagicMock()
         enc.out_stream.encode.return_value = []
         hw_frame = SimpleNamespace(pts=None, time_base=None)
@@ -383,12 +847,65 @@ class TestEncodeBuffer:
             "VideoFrame",
             SimpleNamespace(from_dlpack=from_dlpack),
         )
-        monkeypatch.setattr(video_encoder_module.torch.cuda, "stream", lambda stream: nullcontext())
+        monkeypatch.setattr(
+            video_encoder_module, "stream_context", lambda _stream: nullcontext()
+        )
+        monkeypatch.setattr(video_encoder_module, "_align_yuv_pitch", lambda p: p)
 
         enc._encode_frame(torch.zeros((3, 2, 2), dtype=torch.uint8), 7)
 
         _, kwargs = from_dlpack.call_args
-        assert kwargs == {"format": "nv12", "cuda_context": enc._cuda_ctx}
+        assert kwargs == {
+            "format": "p010le",
+            "stream": 1234,
+            "cuda_context": enc._cuda_ctx,
+        }
+        enc.stream.synchronize.assert_not_called()
+
+    def test_amd_host_transfer_still_synchronizes_before_from_dlpack(
+        self, tmp_path, monkeypatch
+    ):
+        enc = _make_encoder(tmp_path, codec="h264", video_width=2, video_height=2)
+        enc.vendor = video_encoder_module.AcceleratorVendor.AMD
+        enc.stream = MagicMock()
+        order: list = []
+        enc.stream.synchronize = MagicMock(side_effect=lambda: order.append("sync"))
+        enc._host_yuv = MagicMock(name="host_yuv")
+
+        def _track_copy(*args, **kwargs):
+            order.append(("copy", kwargs.get("non_blocking")))
+
+        enc._host_yuv.copy_ = MagicMock(side_effect=_track_copy)
+        enc._packed = torch.zeros((3, 2), dtype=torch.uint8)
+        enc._lut_applier = None
+        enc._converter = SimpleNamespace(
+            sample_dtype=torch.uint8,
+            uses_kernel=False,
+            convert_into=lambda frame, luma, chroma: None,
+        )
+        enc.out_stream = MagicMock()
+        enc.out_stream.encode.return_value = []
+        hw_frame = SimpleNamespace(pts=None, time_base=None)
+        from_dlpack = MagicMock(return_value=hw_frame)
+        monkeypatch.setattr(
+            video_encoder_module.av,
+            "VideoFrame",
+            SimpleNamespace(from_dlpack=from_dlpack),
+        )
+        monkeypatch.setattr(
+            video_encoder_module, "stream_context", lambda _stream: nullcontext()
+        )
+
+        enc._encode_frame(torch.zeros((3, 2, 2), dtype=torch.uint8), 7)
+
+        enc.stream.synchronize.assert_called_once_with()
+        enc._host_yuv.copy_.assert_called_once()
+        _, copy_kwargs = enc._host_yuv.copy_.call_args
+        assert copy_kwargs.get("non_blocking") is False
+        # Finish device work before filling host planes AMF will read (issue #252).
+        assert order == ["sync", ("copy", False)]
+        _, kwargs = from_dlpack.call_args
+        assert kwargs == {"format": "nv12"}
 
     def test_pts_origin_is_removed_from_fragment_timestamps(self, tmp_path):
         enc = _buffered_encoder(tmp_path)
@@ -430,6 +947,31 @@ class TestEncodeBuffer:
         enc._process_buffer(flush_all=True)
         enc._encode_queue.put.assert_called_once_with(("f0", 10, None))
 
+    def test_emitted_pts_stay_strictly_increasing_on_scrambled_source(self, tmp_path):
+        enc = _buffered_encoder(tmp_path)
+        scrambled = [
+            1761760, 1801800, 1841840, 1881880, 1801801, 1801803, 1801804,
+            1801805, 1801802, 1801807, 1801808, 1801809, 1801806, 1801811,
+            1801812, 1801813, 1801810,
+        ]
+        for i, pts in enumerate(scrambled):
+            enc.encode(f"f{i}", pts)
+        while enc.frame_buffer:
+            enc._process_buffer(flush_all=True)
+        emitted = [call.args[0][1] for call in enc._encode_queue.put.call_args_list]
+        assert len(emitted) == len(scrambled)
+        assert all(b > a for a, b in zip(emitted, emitted[1:]))
+
+    def test_in_order_pts_pass_through_unchanged(self, tmp_path):
+        enc = _buffered_encoder(tmp_path)
+        ordered = [1000 * i for i in range(10)]
+        for i, pts in enumerate(ordered):
+            enc.encode(f"f{i}", pts)
+        while enc.frame_buffer:
+            enc._process_buffer(flush_all=True)
+        emitted = [call.args[0][1] for call in enc._encode_queue.put.call_args_list]
+        assert emitted == ordered
+
     def test_encode_raises_pending_worker_error(self, tmp_path):
         enc = _buffered_encoder(tmp_path)
         enc._worker_error = RuntimeError("nvenc exploded")
@@ -459,49 +1001,90 @@ class TestWorkerErrorChannel:
         assert enc._handle_encode_item.call_count == 1
 
 
-def _packet(stream_index, dts, time_base=Fraction(1, 1000)):
+def _packet(stream_index, dts, time_base=Fraction(1, 1000), duration=0):
     return SimpleNamespace(
         stream=SimpleNamespace(index=stream_index),
         dts=dts,
         pts=dts,
         time_base=time_base,
+        duration=duration,
+        size=1,
     )
 
 
-class TestAudioPump:
-    def _audio_encoder(self, tmp_path, packets):
+class TestSourceStreamPump:
+    def _source_encoder(self, tmp_path, packets):
         enc = _make_encoder(tmp_path)
         out_a = MagicMock()
-        enc._audio_pipes = {1: ("copy", out_a, None)}
-        enc._audio_backlog = deque()
-        enc._audio_iter = iter(packets)
+        enc._source_pipes = {1: ("copy", out_a, None)}
+        enc._source_backlog = deque()
+        enc._source_iter = iter(packets)
         enc.dst = MagicMock()
         return enc, out_a
 
     def test_copy_reassigns_stream_and_skips_flush_packet(self, tmp_path):
-        enc, out_a = self._audio_encoder(tmp_path, [])
+        enc, out_a = self._source_encoder(tmp_path, [])
         pkt = _packet(1, dts=0)
-        assert enc._produce_audio_packets(pkt) == [pkt]
+        assert enc._produce_source_packets(pkt) == [pkt]
         assert pkt.stream is out_a
 
-        flush = SimpleNamespace(stream=SimpleNamespace(index=1), dts=None, pts=None, time_base=None)
-        assert enc._produce_audio_packets(flush) == []
+        flush = SimpleNamespace(
+            stream=SimpleNamespace(index=1),
+            dts=None,
+            pts=None,
+            time_base=None,
+            size=0,
+        )
+        assert enc._produce_source_packets(flush) == []
 
     def test_pump_respects_threshold(self, tmp_path):
         packets = [_packet(1, dts=0), _packet(1, dts=500), _packet(1, dts=1500)]
-        enc, _ = self._audio_encoder(tmp_path, packets)
+        enc, _ = self._source_encoder(tmp_path, packets)
 
-        enc._pump_audio(1.0)
+        enc._pump_source_streams(1.0)
         assert enc.dst.mux.call_count == 2
-        assert len(enc._audio_backlog) == 1  # dts=1500 held back
+        assert len(enc._source_backlog) == 1  # dts=1500 held back
 
-        enc._pump_audio(None)
+        enc._pump_source_streams(None)
         assert enc.dst.mux.call_count == 3
 
-    def test_pump_without_audio_is_noop(self, tmp_path):
+    def test_pump_without_source_streams_is_noop(self, tmp_path):
         enc = _make_encoder(tmp_path)
-        enc._audio_iter = None
-        enc._pump_audio(1.0)
+        enc._source_iter = None
+        enc._pump_source_streams(1.0)
+
+    def test_text_subtitle_transcode_preserves_packet_timing(self, tmp_path):
+        enc = _make_encoder(tmp_path)
+        subtitle_set = object()
+        input_codec = SimpleNamespace(decode2=MagicMock(return_value=subtitle_set))
+        output_packet = SimpleNamespace(
+            stream=None,
+            pts=None,
+            dts=None,
+            duration=0,
+            time_base=None,
+        )
+        output_codec = SimpleNamespace(
+            encode_subtitle=MagicMock(return_value=output_packet)
+        )
+        output_stream = SimpleNamespace(
+            codec_context=output_codec,
+            time_base=Fraction(1, 1_000),
+        )
+        enc._source_pipes = {1: ("subtitle_transcode", output_stream, None)}
+        packet = _packet(1, dts=45_000, time_base=Fraction(1, 90_000), duration=90_000)
+        packet.dts = None
+        packet.stream.codec_context = input_codec
+
+        assert enc._produce_source_packets(packet) == [output_packet]
+
+        input_codec.decode2.assert_called_once_with(packet)
+        output_codec.encode_subtitle.assert_called_once_with(subtitle_set)
+        assert output_packet.stream is output_stream
+        assert output_packet.pts == 500
+        assert output_packet.dts == 500
+        assert output_packet.duration == 1_000
+        assert output_packet.time_base == Fraction(1, 1_000)
 
 
 class TestDropUnsupportedNvencOverrides:

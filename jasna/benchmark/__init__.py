@@ -29,7 +29,7 @@ def run_benchmarks(
     batch_size: int = 4,
     fp16: bool = True,
     benchmark_videos: list[Path],
-    detection_score_threshold: float = 0.2,
+    detection_score_threshold: float | None = None,
     restoration_model_path: Path | None = None,
     compile_basicvsrpp: bool = True,
     benchmark_filter: str | None = None,
@@ -114,8 +114,12 @@ def run_benchmark_cli(args: Namespace) -> None:
         batch_size=int(args.batch_size),
         fp16=bool(args.fp16),
         benchmark_videos=benchmark_videos,
-        detection_score_threshold=float(args.detection_score_threshold),
+        detection_score_threshold=(
+            None
+            if args.detection_score_threshold is None
+            else float(args.detection_score_threshold)
+        ),
         restoration_model_path=Path(args.restoration_model_path),
         compile_basicvsrpp=bool(args.compile_basicvsrpp),
-        benchmark_filter=getattr(args, 'benchmark_filter', None),
+        benchmark_filter=getattr(args, "benchmark_filter", None),
     )

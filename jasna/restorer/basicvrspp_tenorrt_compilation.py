@@ -30,7 +30,6 @@ def compile_mosaic_restoration_model(
     device: str | torch.device,
     fp16: bool,
     mosaic_restoration_config_path: str | None = None,
-    max_clip_size: int = 60,
     optimization_level: int = 5,
 ) -> bool:
     """Compile BasicVSR++ into 6 TensorRT sub-engines (loop_body × 4 + preprocess + upsample).
@@ -40,7 +39,7 @@ def compile_mosaic_restoration_model(
     if isinstance(device, str):
         device = torch.device(device)
 
-    if all_sub_engines_exist(mosaic_restoration_model_path, fp16, max_clip_size):
+    if all_sub_engines_exist(mosaic_restoration_model_path, fp16):
         return True
 
     if device.type != "cuda":
@@ -68,7 +67,6 @@ def compile_mosaic_restoration_model(
         device=device,
         fp16=fp16,
         model_weights_path=mosaic_restoration_model_path,
-        max_clip_size=max_clip_size,
         optimization_level=optimization_level,
     )
     del model
@@ -77,7 +75,7 @@ def compile_mosaic_restoration_model(
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    return all_sub_engines_exist(mosaic_restoration_model_path, fp16, max_clip_size)
+    return all_sub_engines_exist(mosaic_restoration_model_path, fp16)
 
 
 def basicvsrpp_startup_policy(
@@ -86,7 +84,6 @@ def basicvsrpp_startup_policy(
     device: torch.device,
     fp16: bool,
     compile_basicvsrpp: bool,
-    max_clip_size: int = 60,
     optimization_level: int = 5,
 ) -> bool:
     """Returns whether runtime should attempt TensorRT execution.
@@ -102,14 +99,13 @@ def basicvsrpp_startup_policy(
     if not bool(compile_basicvsrpp):
         return False
 
-    if all_sub_engines_exist(restoration_model_path, fp16, max_clip_size):
+    if all_sub_engines_exist(restoration_model_path, fp16):
         return True
 
     return compile_mosaic_restoration_model(
         mosaic_restoration_model_path=restoration_model_path,
         device=device,
         fp16=fp16,
-        max_clip_size=max_clip_size,
         optimization_level=optimization_level,
     )
 

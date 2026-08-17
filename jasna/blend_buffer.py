@@ -22,9 +22,11 @@ class BlendBuffer:
         blend_mask_fn: Callable[
             [torch.Tensor, tuple[int, int, int, int], tuple[int, int]], torch.Tensor
         ] = create_bbox_blend_mask,
+        vr_projector=None,
     ):
         self.device = device
         self.blend_mask_fn = blend_mask_fn
+        self.vr_projector = vr_projector
         self._lock = threading.Lock()
         self.pending_map: dict[int, set[int]] = {}
         self._results: dict[int, SecondaryRestoreResult] = {}
@@ -91,17 +93,22 @@ class BlendBuffer:
                 for track_id in pending
             ]
 
+        # A frame can be pending on tracks whose restoration never arrived. The
+        # clone is a full-frame copy (0.13 ms at 8K VR), so only pay it once
+        # something is actually going to be composited.
+        ready = [(track_id, sr) for track_id, sr in results_snapshot if sr is not None]
+        if not ready:
+            return original_frame
+
         blended = original_frame.clone()
         device = original_frame.device
 
-        for track_id, sr in results_snapshot:
-            if sr is None:
-                continue
+        for track_id, sr in ready:
             self._apply_blend(blended, original_frame, frame_idx, track_id, sr, device)
 
         with self._lock:
-            for track_id, sr in results_snapshot:
-                if sr is not None and self._result_last_frame.get(track_id) == frame_idx:
+            for track_id, sr in ready:
+                if self._result_last_frame.get(track_id) == frame_idx:
                     del self._results[track_id]
                     del self._result_last_frame[track_id]
 
@@ -141,6 +148,19 @@ class BlendBuffer:
             mode="bilinear",
             align_corners=False,
         ).squeeze(0)
+
+        if self.vr_projector is not None:
+            # Project the restoration *delta* back to source space (not the whole
+            # restored patch): outside the mosaic the model leaves the patch
+            # unchanged, so the delta is ~0 there and the inverse resample cannot
+            # smear reprojection error onto untouched pixels.
+            original_projected = self.vr_projector.project_region(
+                original, (x1, y1, x2, y2)
+            )
+            source_delta = self.vr_projector.source_region_from_patch(
+                resized_back - original_projected, (x1, y1, x2, y2)
+            )
+            resized_back = original[:, y1:y2, x1:x2].float() + source_delta
 
         blend_mask = self.blend_mask_fn(mask_lr, (x1, y1, x2, y2), sr.frame_shape)
 

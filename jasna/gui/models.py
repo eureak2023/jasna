@@ -33,11 +33,13 @@ class JobProcessingSnapshot:
     segments: tuple[SegmentRange, ...]
     detection_model: str | None
     detection_score_threshold: float | None
+    vr_projection: str | None
 
 
 @dataclass
 class JobItem:
     path: Path
+    output_path: Path | None = None
     id: int = field(default_factory=lambda: next(_job_id_counter))
     status: JobStatus = JobStatus.PENDING
     duration_seconds: float | None = None
@@ -47,6 +49,7 @@ class JobItem:
     segments: tuple[SegmentRange, ...] = ()
     detection_model: str | None = None
     detection_score_threshold: float | None = None
+    vr_projection: str | None = None
     _state_lock: threading.Lock = field(
         default_factory=threading.Lock,
         repr=False,
@@ -81,6 +84,7 @@ class JobItem:
         *,
         detection_model: str,
         detection_score_threshold: float,
+        vr_projection: str,
     ) -> bool:
         with self._state_lock:
             if self.status is not JobStatus.PENDING:
@@ -88,6 +92,7 @@ class JobItem:
             self.segments = tuple(segments)
             self.detection_model = str(detection_model)
             self.detection_score_threshold = float(detection_score_threshold)
+            self.vr_projection = str(vr_projection)
             return True
 
     def begin_processing(self) -> JobProcessingSnapshot | None:
@@ -99,6 +104,7 @@ class JobItem:
                 segments=self.segments,
                 detection_model=self.detection_model,
                 detection_score_threshold=self.detection_score_threshold,
+                vr_projection=self.vr_projection,
             )
 
 
@@ -123,6 +129,7 @@ class AppSettings:
     temporal_overlap: int = 8
     enable_crossfade: bool = True
     vr_mode: str = "auto"
+    vr_projection: str = "auto"
     fp16_mode: bool = True
     
     # Denoising
@@ -136,14 +143,18 @@ class AppSettings:
     tvai_scale: int = 4
     tvai_workers: int = 2
     tvai_args: str = "preblur=0:noise=0:details=0:halo=0:blur=0:compression=0:estimate=8:blend=0.2:device=-2:vram=1:instances=1"
+    tvai_denoise: bool = False
     rtx_scale: int = 4  # 2, 4
     rtx_quality: str = "high"  # low, medium, high, ultra
     rtx_denoise: str = "medium"  # none, low, medium, high, ultra
     rtx_deblur: str = "none"  # none, low, medium, high, ultra
     
     # Detection
-    detection_model: str = "rfdetr-v5"  # RF-DETR, Lada YOLO, or ZeLeFans VR YOLO registry name
-    detection_score_threshold: float = 0.25
+    detection_model: str = "rfdetr-v6"  # RF-DETR, Lada YOLO, or ZeLeFans VR YOLO registry name
+    detection_score_threshold: float = 0.35
+    max_detection_gap: int = 2
+    min_detection_duration: int = 2
+    scene_detection: bool = True
     compile_basicvsrpp: bool = True
     
     # Image restoration (SD 1.5 inpaint; used only for still-image inputs)
@@ -155,14 +166,17 @@ class AppSettings:
 
     # Encoding
     codec: str = "hevc"
-    encoder_cq: int = 22
+    encoder_cq: int | None = None
     encoder_custom_args: str = ""
+    sharpen_strength: float = 0.0
     lut_path: str = ""
     retarget_high_fps: bool = False
+    fmp4: bool = False
 
     # Post-export action
     post_export_action: str = "none"  # none, shutdown, command
     post_export_command: str = ""
+    post_export_video_command: str = ""
     
     # Output
     output_same_as_input: bool = True
@@ -250,7 +264,30 @@ def _migrate_preset_dict(preset_dict: dict) -> dict:
     migrated = {k: v for k, v in preset_dict.items() if k in known_fields}
     custom_args = migrated.get("encoder_custom_args")
     if custom_args:
-        migrated["encoder_custom_args"] = _migrate_encoder_custom_args(custom_args)
+        from jasna.media import parse_encoder_settings
+
+        migrated_args = _migrate_encoder_custom_args(custom_args)
+        try:
+            parsed_args = parse_encoder_settings(migrated_args)
+        except (ValueError, json.JSONDecodeError):
+            migrated["encoder_custom_args"] = migrated_args
+        else:
+            cq_key = next(
+                (
+                    key
+                    for key in ("cq", "qvbr_quality_level")
+                    if key in parsed_args
+                ),
+                None,
+            )
+            if cq_key is not None:
+                cq = parsed_args[cq_key]
+                if isinstance(cq, int) and not isinstance(cq, bool):
+                    migrated["encoder_cq"] = cq
+                    del parsed_args[cq_key]
+            migrated["encoder_custom_args"] = ",".join(
+                f"{key}={value}" for key, value in parsed_args.items()
+            )
     if "codec" in migrated:
         migrated["codec"] = _normalize_preset_codec(migrated["codec"])
     return migrated
@@ -329,6 +366,13 @@ class PresetManager:
     def is_factory_preset(self, name: str) -> bool:
         """Check if preset is a factory preset."""
         return name in self.FACTORY_PRESETS
+
+    def resolve(self, name: str) -> tuple[str, AppSettings]:
+        """Return (name, preset), falling back to Default for unknown names."""
+        preset = self.get_preset(name)
+        if preset is None:
+            return "Default", self.FACTORY_PRESETS["Default"]
+        return name, preset
     
     def create_preset(self, name: str, settings: AppSettings) -> bool:
         """Create a new user preset. Returns False if name is invalid."""

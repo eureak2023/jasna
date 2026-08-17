@@ -17,7 +17,8 @@ from pathlib import Path
 from PIL import Image
 
 from jasna.gui.models import AppSettings
-from jasna.gui.video_session import VideoSession, build_video_session, video_session_key
+from jasna.gui.video_session import build_video_session, release_session_memory, video_session_key
+from jasna.session_factory import RestorationSession
 from jasna.media import VideoMetadata
 
 
@@ -59,6 +60,7 @@ RestorationEvent = RestorationStatus | RestorationFrame | RestorationClip | Rest
 class _Request:
     center_seconds: float
     settings: AppSettings
+    projection: str
     generation: int
     playback: bool
 
@@ -254,15 +256,23 @@ class RestorationPreviewWorker:
     def start(self) -> None:
         self._thread.start()
 
-    def request(self, center_seconds: float, settings: AppSettings, *, playback: bool = False) -> int:
+    def request(
+        self,
+        center_seconds: float,
+        settings: AppSettings,
+        *,
+        projection: str,
+        playback: bool = False,
+    ) -> int:
         self._generation += 1
         self._cancel_active_pass()
         self._replace_command(
             _Request(
-                max(0.0, float(center_seconds)),
-                settings,
-                self._generation,
-                bool(playback),
+                center_seconds=max(0.0, float(center_seconds)),
+                settings=settings,
+                projection=projection,
+                generation=self._generation,
+                playback=bool(playback),
             )
         )
         return self._generation
@@ -308,7 +318,7 @@ class RestorationPreviewWorker:
             pass
 
     def _run(self) -> None:
-        session: VideoSession | None = None
+        session: RestorationSession | None = None
         session_key: tuple | None = None
         detection_model = None
         try:
@@ -329,6 +339,7 @@ class RestorationPreviewWorker:
                             detection_model = None
                         if session is not None:
                             session.close()
+                            release_session_memory(session.device)
                             session = None
                             session_key = None
                         self.events.put(RestorationStatus("loading_models", command.generation))
@@ -340,7 +351,7 @@ class RestorationPreviewWorker:
                         from jasna.mosaic.detection_registry import build_detection_model
 
                         detection_model = build_detection_model(
-                            session.det_name,
+                            session.detection_model_name,
                             session.detection_model_path,
                             batch_size=command.settings.batch_size,
                             device=session.device,
@@ -362,13 +373,14 @@ class RestorationPreviewWorker:
                 detection_model.close()
             if session is not None:
                 session.close()
+                release_session_memory(session.device)
             if self._on_stopped is not None:
                 self._on_stopped()
 
     def _run_preview_pass(
         self,
         command: _Request,
-        session: VideoSession,
+        session: RestorationSession,
         detection_model,
     ) -> RestorationFrame | RestorationClip | None:
         from queue import Empty, Queue
@@ -386,15 +398,16 @@ class RestorationPreviewWorker:
 
         settings = command.settings
         from jasna.vr180 import (
-            FisheyeProjector,
             SbsDetectionAdapter,
             resolve_vr_mode,
         )
+        from jasna.vr_projection import build_vr_projector
 
         vr_resolution = resolve_vr_mode(
             settings.vr_mode,
             self.metadata,
             self.path,
+            projection=command.projection,
         )
         pass_detection_model = (
             SbsDetectionAdapter(detection_model)
@@ -402,12 +415,13 @@ class RestorationPreviewWorker:
             else detection_model
         )
         vr_projector = (
-            FisheyeProjector(
+            build_vr_projector(
+                vr_resolution.projection,
                 eye_width=int(self.metadata.video_width) // 2,
                 height=int(self.metadata.video_height),
                 device=session.device,
             )
-            if vr_resolution.uses_fisheye
+            if vr_resolution.is_sbs
             else None
         )
         window = (
@@ -426,7 +440,7 @@ class RestorationPreviewWorker:
         metadata_queue: Queue = Queue(maxsize=settings.max_clip_size * 5)
 
         error_holder: list[BaseException] = []
-        blend_buffer = BlendBuffer(device=session.device)
+        blend_buffer = BlendBuffer(device=session.device, vr_projector=vr_projector)
         crop_buffers: dict[int, CropBuffer] = {}
         crop_lock = threading.Lock()
         primary_idle_event = threading.Event()
@@ -474,7 +488,10 @@ class RestorationPreviewWorker:
                     detection_model=pass_detection_model,
                     max_clip_size=settings.max_clip_size,
                     temporal_overlap=settings.temporal_overlap,
+                    max_detection_gap=settings.max_detection_gap,
+                    min_detection_duration=settings.min_detection_duration,
                     enable_crossfade=settings.enable_crossfade,
+                    scene_detection=settings.scene_detection,
                     blend_buffer=blend_buffer,
                     crop_buffers=crop_buffers,
                     clip_queue=clip_queue,
@@ -526,7 +543,6 @@ class RestorationPreviewWorker:
                     cancel_event=cancel_event,
                     seek_ts=seek_ts,
                     vram_offloader=vram_offloader,
-                    vr_projector=vr_projector,
                 ),
                 name="PreviewBlendEncode", daemon=True,
             ),

@@ -57,6 +57,7 @@ class TestMainValidation:
             pipeline_cls = _run_main_with_args(tmp_path, ["--segments", "1-2"])
 
         assert pipeline_cls.call_args.kwargs["codec"] == "h264"
+        assert pipeline_cls.call_args.kwargs["encoder_settings"] == {"cq": 25}
         assert pipeline_cls.call_args.kwargs["segments"] == (SegmentRange(1, 2),)
         assert pipeline_cls.call_args.kwargs["splice_plan"] is splice_plan
 
@@ -107,6 +108,15 @@ class TestMainValidation:
     def test_detection_score_threshold_out_of_range_raises(self, tmp_path):
         with pytest.raises(ValueError, match="detection-score-threshold must be in"):
             _run_main_with_args(tmp_path, ["--detection-score-threshold", "1.5"])
+
+    @pytest.mark.parametrize("value", ["1.5", "-0.1"])
+    def test_sharpen_out_of_range_raises(self, tmp_path, value):
+        with pytest.raises(ValueError, match="sharpen must be in"):
+            _run_main_with_args(tmp_path, ["--sharpen", value])
+
+    def test_sharpen_is_forwarded_to_the_pipeline(self, tmp_path):
+        pipeline_cls = _run_main_with_args(tmp_path, ["--sharpen", "0.4"])
+        assert pipeline_cls.call_args.kwargs["sharpen_strength"] == 0.4
 
     def test_missing_input_file_raises(self, tmp_path):
         with pytest.raises(FileNotFoundError):
@@ -162,3 +172,11 @@ class TestMainValidation:
     def test_retarget_high_fps_rejected_for_streaming(self, tmp_path):
         with pytest.raises(SystemExit):
             _run_main_with_args(tmp_path, ["--stream", "--retarget-high-fps"])
+
+    def test_fmp4_rejected_for_streaming(self, tmp_path):
+        with pytest.raises(SystemExit):
+            _run_main_with_args(tmp_path, ["--stream", "--fmp4"])
+
+    def test_fmp4_rejected_with_segments(self, tmp_path):
+        with pytest.raises(SystemExit):
+            _run_main_with_args(tmp_path, ["--segments", "10-20", "--fmp4"])

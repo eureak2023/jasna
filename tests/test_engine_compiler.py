@@ -27,7 +27,7 @@ def _mock_proc(lines: list[str], returncode: int = 0) -> MagicMock:
 def test_request_json_roundtrip() -> None:
     req = EngineCompilationRequest(
         device="cuda:0", fp16=True, basicvsrpp=True,
-        basicvsrpp_model_path="/path/to/model.pth", basicvsrpp_max_clip_size=90,
+        basicvsrpp_model_path="/path/to/model.pth",
         detection=True, detection_model_name="rfdetr-v5",
         detection_model_path="/path/to/det.onnx", detection_batch_size=8, unet4x=True,
     )
@@ -186,12 +186,52 @@ def test_detection_engine_exists_rfdetr(tmp_path: Path) -> None:
     ) is False
 
     from jasna.trt import get_onnx_tensorrt_engine_path
-    engine = get_onnx_tensorrt_engine_path(onnx_path, batch_size=4, fp16=True)
+    engine = get_onnx_tensorrt_engine_path(
+        onnx_path,
+        batch_size=4,
+        fp16=True,
+        dynamic_batch=False,
+    )
     engine.parent.mkdir(parents=True, exist_ok=True)
     engine.write_text("x")
     assert _detection_engine_exists(
         "rfdetr-v5", str(onnx_path), 4, True, "cuda:0"
     ) is True
+
+
+def test_detection_engine_exists_rfdetr_v6_uses_dynamic_path(
+    tmp_path: Path,
+) -> None:
+    onnx_path = tmp_path / "rfdetr-v6.onnx"
+    onnx_path.write_text("x")
+
+    from jasna.trt import get_onnx_tensorrt_engine_path
+
+    engine = get_onnx_tensorrt_engine_path(
+        onnx_path,
+        batch_size=8,
+        fp16=True,
+        dynamic_batch=True,
+    )
+    engine.write_text("x")
+    assert _detection_engine_exists(
+        "rfdetr-v6",
+        str(onnx_path),
+        8,
+        True,
+        "cuda:0",
+    )
+
+
+def test_dynamic_batch_engine_path_is_distinct_from_fixed() -> None:
+    from jasna.engine_paths import get_onnx_tensorrt_engine_path
+
+    onnx = Path("model_weights/rfdetr-v6.onnx")
+    fixed = get_onnx_tensorrt_engine_path(onnx, batch_size=4, fp16=True)
+    dyn = get_onnx_tensorrt_engine_path(onnx, batch_size=4, fp16=True, dynamic_batch=True)
+    assert ".bs4." in fixed.name
+    assert ".bs1-4." in dyn.name
+    assert fixed != dyn
 
 
 def test_unet4x_engine_exists_plaintext(monkeypatch, tmp_path: Path) -> None:

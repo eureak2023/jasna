@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,9 +16,22 @@ log = logging.getLogger(__name__)
 VR_MODES = ("auto", "off", "sbs", "sbs-fisheye")
 FISHEYE_STUDIO_TOKENS = frozenset({"FSVSS", "SAVR", "URVRSP", "CRVR", "PXVR"})
 DIRECT_STUDIO_TOKENS = frozenset({"S1VR", "MDVR", "VRKM", "IPVR"})
+PROJECTION_KINDS = ("raw", "fisheye", "gnomonic")
+PROJECTION_CHOICES = ("auto", *PROJECTION_KINDS)
 _SBS_ASPECT_MIN = 1.90
 _SBS_ASPECT_MAX = 2.10
 _AUTO_SBS_MIN_HEIGHT = 1080
+
+STUDIO_PROJECTION: dict[str, str] = {
+    "ATVR": "raw",
+    "CJVR": "raw",
+    "IPVR": "raw",
+    "KAVR": "raw",
+    "NHVR": "fisheye",
+    "PXVR": "fisheye",
+    "TMAVR": "fisheye",
+    "VRPRD": "gnomonic",
+}
 
 
 @dataclass(frozen=True)
@@ -28,22 +40,48 @@ class VrModeResolution:
     resolved: str
     reason: str
     display_aspect: float
+    projection: str
 
     @property
     def is_sbs(self) -> bool:
-        return self.resolved in {"sbs", "sbs-fisheye"}
-
-    @property
-    def uses_fisheye(self) -> bool:
-        return self.resolved == "sbs-fisheye"
+        return self.resolved == "sbs"
 
 
-def _filename_tokens(path: Path) -> set[str]:
-    return {
-        token
-        for token in re.split(r"[^A-Z0-9]+", path.stem.upper())
-        if token
-    }
+def _studio_matches(path: Path, codes: frozenset[str]) -> list[str]:
+    # Substring match: real releases glue the studio code to the number
+    # (e.g. ``savr00327``), which a token split on separators would miss.
+    stem = path.stem.upper()
+    return sorted(code for code in codes if code in stem)
+
+
+def studio_code(name: str) -> str:
+    stem = re.sub(r"^\[[^\]]*\]\s*", "", name).upper()
+    m = re.match(r"^([0-9]?[A-Z]{2,7})", stem)
+    return m.group(1) if m else ""
+
+
+def _normalize_projection(value: str) -> str:
+    projection = str(value).strip().lower()
+    if projection not in PROJECTION_CHOICES:
+        raise ValueError(
+            f"Unknown VR projection '{projection}'. "
+            f"Valid projections: {', '.join(PROJECTION_CHOICES)}"
+        )
+    return projection
+
+
+def resolve_projection(input_path: Path, requested: str = "auto") -> str:
+    projection = _normalize_projection(requested)
+    if projection != "auto":
+        return projection
+    routed = STUDIO_PROJECTION.get(studio_code(input_path.stem))
+    if routed:
+        return routed
+    if _studio_matches(input_path, FISHEYE_STUDIO_TOKENS):
+        return "fisheye"
+    if _studio_matches(input_path, DIRECT_STUDIO_TOKENS):
+        return "raw"
+    return "raw"
 
 
 def _display_aspect(metadata) -> float:
@@ -72,12 +110,15 @@ def resolve_vr_mode(
     requested: str,
     metadata,
     input_path: Path,
+    *,
+    projection: str = "auto",
 ) -> VrModeResolution:
     requested = str(requested).strip().lower()
     if requested not in VR_MODES:
         raise ValueError(
             f"Unknown VR mode '{requested}'. Valid modes: {', '.join(VR_MODES)}"
         )
+    projection = _normalize_projection(projection)
 
     width = int(metadata.video_width)
     height = int(metadata.video_height)
@@ -86,78 +127,58 @@ def resolve_vr_mode(
         width == height * 2 and height > _AUTO_SBS_MIN_HEIGHT
     )
     if requested == "off":
-        result = VrModeResolution(requested, "off", "explicit mode", aspect)
+        resolved, reason = "off", "explicit mode"
     elif requested != "auto":
         if width % 2:
             raise ValueError(
                 f"VR SBS processing requires an even frame width, got {width}"
             )
-        reason = "explicit mode"
+        resolved, reason = "sbs", "explicit mode"
         if not (_SBS_ASPECT_MIN <= aspect <= _SBS_ASPECT_MAX):
             reason += f"; unusual SBS display aspect {aspect:.3f}"
-        result = VrModeResolution(requested, requested, reason, aspect)
     elif width % 2:
-        result = VrModeResolution(
-            requested,
-            "off",
-            f"odd frame width {width}",
-            aspect,
-        )
+        resolved, reason = "off", f"odd frame width {width}"
     elif (
         not is_high_resolution_2_to_1
         and not (_SBS_ASPECT_MIN <= aspect <= _SBS_ASPECT_MAX)
     ):
-        result = VrModeResolution(
-            requested,
-            "off",
-            f"display aspect {aspect:.3f} is outside the SBS gate",
-            aspect,
-        )
+        resolved, reason = "off", f"display aspect {aspect:.3f} is outside the SBS gate"
     else:
-        tokens = _filename_tokens(input_path)
-        fisheye_matches = sorted(tokens & FISHEYE_STUDIO_TOKENS)
-        direct_matches = sorted(tokens & DIRECT_STUDIO_TOKENS)
+        fisheye_matches = _studio_matches(input_path, FISHEYE_STUDIO_TOKENS)
+        direct_matches = _studio_matches(input_path, DIRECT_STUDIO_TOKENS)
+        routed_code = studio_code(input_path.stem)
         if fisheye_matches:
-            token = fisheye_matches[0]
-            result = VrModeResolution(
-                requested,
-                "sbs-fisheye",
-                f"known fisheye-remap studio token {token}",
-                aspect,
-            )
+            resolved, reason = "sbs", f"known fisheye-remap studio token {fisheye_matches[0]}"
         elif direct_matches:
-            token = direct_matches[0]
-            result = VrModeResolution(
-                requested,
-                "sbs",
-                f"known direct-SBS studio token {token}",
-                aspect,
-            )
+            resolved, reason = "sbs", f"known direct-SBS studio token {direct_matches[0]}"
+        elif routed_code in STUDIO_PROJECTION:
+            resolved, reason = "sbs", f"routed VR studio {routed_code}"
         elif _has_sbs_spatial_metadata(metadata):
-            result = VrModeResolution(
-                requested,
-                "sbs",
-                "side-by-side equirectangular spatial metadata",
-                aspect,
-            )
+            resolved, reason = "sbs", "side-by-side equirectangular spatial metadata"
         elif is_high_resolution_2_to_1:
-            result = VrModeResolution(
-                requested,
-                "sbs",
-                f"2:1 frame above {_AUTO_SBS_MIN_HEIGHT}p",
-                aspect,
-            )
+            resolved, reason = "sbs", f"2:1 frame above {_AUTO_SBS_MIN_HEIGHT}p"
         else:
-            result = VrModeResolution(
-                requested,
-                "off",
-                "no trusted studio token or spatial metadata",
-                aspect,
-            )
+            resolved, reason = "off", "no trusted studio token or spatial metadata"
 
+    if resolved != "sbs":
+        resolved_projection = "none"
+    elif projection != "auto":
+        resolved_projection = projection
+    elif requested == "sbs-fisheye":
+        resolved_projection = "fisheye"
+    else:
+        resolved_projection = resolve_projection(input_path)
+
+    result = VrModeResolution(
+        requested,
+        resolved,
+        reason,
+        aspect,
+        resolved_projection,
+    )
     message = (
-        "VR mode: requested=%s resolved=%s reason=%s"
-        % (result.requested, result.resolved, result.reason)
+        "VR mode: requested=%s resolved=%s projection=%s reason=%s"
+        % (result.requested, result.resolved, result.projection, result.reason)
     )
     if "unusual SBS" in result.reason:
         log.warning(message)
@@ -262,232 +283,3 @@ class SbsDetectionAdapter:
     def close(self) -> None:
         if hasattr(self.detector, "close"):
             self.detector.close()
-
-
-class FisheyeProjector:
-    def __init__(
-        self,
-        *,
-        eye_width: int,
-        height: int,
-        device: torch.device,
-        fov_degrees: float = 180.0,
-    ) -> None:
-        self.eye_width = int(eye_width)
-        self.height = int(height)
-        if self.eye_width <= 0 or self.height <= 0:
-            raise ValueError(
-                f"Invalid eye dimensions {self.eye_width}x{self.height}"
-            )
-        self.device = device
-        self.forward_grid = self._build_forward_grid(
-            self.eye_width,
-            self.height,
-            fov_degrees,
-        ).to(device)
-        self.inverse_grid = self._build_inverse_grid(
-            self.eye_width,
-            self.height,
-            fov_degrees,
-        ).to(device)
-
-    @staticmethod
-    def _pixel_centers(length: int) -> torch.Tensor:
-        return (torch.arange(length, dtype=torch.float64) + 0.5) / length
-
-    @classmethod
-    def _build_forward_grid(
-        cls,
-        width: int,
-        height: int,
-        fov_degrees: float,
-    ) -> torch.Tensor:
-        half_fov = math.radians(float(fov_degrees)) * 0.5
-        output_y, output_x = torch.meshgrid(
-            cls._pixel_centers(height),
-            cls._pixel_centers(width),
-            indexing="ij",
-        )
-        fisheye_x = output_x * 2.0 - 1.0
-        fisheye_y = output_y * 2.0 - 1.0
-        radius = torch.sqrt(fisheye_x.square() + fisheye_y.square())
-        theta = radius * half_fov
-        phi = torch.atan2(fisheye_y, fisheye_x)
-        sin_theta = torch.sin(theta)
-        direction_x = sin_theta * torch.cos(phi)
-        direction_y = sin_theta * torch.sin(phi)
-        direction_z = torch.cos(theta)
-        longitude = torch.atan2(direction_x, direction_z)
-        latitude = torch.asin(direction_y.clamp(-1.0, 1.0))
-        source_x = longitude / math.pi + 0.5
-        source_y = latitude / math.pi + 0.5
-        grid_x = source_x * 2.0 - 1.0
-        grid_y = source_y * 2.0 - 1.0
-        outside = radius > 1.0
-        grid_x = torch.where(outside, torch.full_like(grid_x, 2.0), grid_x)
-        grid_y = torch.where(outside, torch.full_like(grid_y, 2.0), grid_y)
-        return torch.stack((grid_x, grid_y), dim=-1).unsqueeze(0).float()
-
-    @classmethod
-    def _build_inverse_grid(
-        cls,
-        width: int,
-        height: int,
-        fov_degrees: float,
-    ) -> torch.Tensor:
-        half_fov = math.radians(float(fov_degrees)) * 0.5
-        output_y, output_x = torch.meshgrid(
-            cls._pixel_centers(height),
-            cls._pixel_centers(width),
-            indexing="ij",
-        )
-        longitude = (output_x - 0.5) * math.pi
-        latitude = (output_y - 0.5) * math.pi
-        direction_x = torch.cos(latitude) * torch.sin(longitude)
-        direction_y = torch.sin(latitude)
-        direction_z = torch.cos(latitude) * torch.cos(longitude)
-        theta = torch.acos(direction_z.clamp(-1.0, 1.0))
-        phi = torch.atan2(direction_y, direction_x)
-        radius = theta / half_fov
-        fisheye_x = radius * torch.cos(phi)
-        fisheye_y = radius * torch.sin(phi)
-        return torch.stack((fisheye_x, fisheye_y), dim=-1).unsqueeze(0).float()
-
-    def _validate_eye(self, eye: torch.Tensor) -> tuple[torch.Tensor, bool]:
-        single = eye.ndim == 3
-        if single:
-            eye = eye.unsqueeze(0)
-        if eye.ndim != 4 or eye.shape[1] != 3:
-            raise ValueError(
-                f"Expected (3,H,W) or (N,3,H,W), got {tuple(eye.shape)}"
-            )
-        if eye.shape[-2:] != (self.height, self.eye_width):
-            raise ValueError(
-                f"Eye size {tuple(eye.shape[-2:])} does not match "
-                f"{(self.height, self.eye_width)}"
-            )
-        return eye, single
-
-    def _sample_eye(
-        self,
-        eye: torch.Tensor,
-        grid: torch.Tensor,
-        *,
-        preserve_dtype: bool,
-    ) -> torch.Tensor:
-        eye, single = self._validate_eye(eye)
-        output_dtype = eye.dtype
-        output = torch.empty(
-            eye.shape,
-            dtype=torch.float32 if not preserve_dtype else output_dtype,
-            device=eye.device,
-        )
-        for index in range(eye.shape[0]):
-            sampled = F.grid_sample(
-                eye[index : index + 1].float(),
-                grid,
-                mode="bilinear",
-                padding_mode="zeros",
-                align_corners=False,
-            )[0]
-            if preserve_dtype and not output_dtype.is_floating_point:
-                sampled = sampled.round().clamp(0, 255).to(output_dtype)
-            elif preserve_dtype:
-                sampled = sampled.to(output_dtype)
-            output[index] = sampled
-        return output[0] if single else output
-
-    def _validate_sbs(self, frames: torch.Tensor) -> tuple[torch.Tensor, bool]:
-        single = frames.ndim == 3
-        if single:
-            frames = frames.unsqueeze(0)
-        if frames.ndim != 4 or frames.shape[1] != 3:
-            raise ValueError(
-                f"Expected (3,H,W) or (N,3,H,W), got {tuple(frames.shape)}"
-            )
-        expected = (self.height, self.eye_width * 2)
-        if frames.shape[-2:] != expected:
-            raise ValueError(
-                f"SBS size {tuple(frames.shape[-2:])} does not match {expected}"
-            )
-        return frames, single
-
-    @torch.inference_mode()
-    def forward_sbs(self, frames: torch.Tensor) -> torch.Tensor:
-        frames, single = self._validate_sbs(frames)
-        output = torch.empty_like(frames)
-        for index in range(frames.shape[0]):
-            for eye_index in range(2):
-                start = eye_index * self.eye_width
-                end = start + self.eye_width
-                output[index, :, :, start:end] = self._sample_eye(
-                    frames[index, :, :, start:end],
-                    self.forward_grid,
-                    preserve_dtype=True,
-                )
-        return output[0] if single else output
-
-    @torch.inference_mode()
-    def restore_delta_to_source(
-        self,
-        source_sbs: torch.Tensor,
-        projected_source_sbs: torch.Tensor,
-        blended_fisheye_sbs: torch.Tensor,
-    ) -> torch.Tensor:
-        source_sbs, single = self._validate_sbs(source_sbs)
-        projected_source_sbs, _ = self._validate_sbs(projected_source_sbs)
-        blended_fisheye_sbs, _ = self._validate_sbs(blended_fisheye_sbs)
-        if (
-            source_sbs.shape != projected_source_sbs.shape
-            or source_sbs.shape != blended_fisheye_sbs.shape
-        ):
-            raise ValueError("Source, projected source, and blended frames must match")
-
-        output = source_sbs.float()
-        for index in range(source_sbs.shape[0]):
-            for eye_index in range(2):
-                start = eye_index * self.eye_width
-                end = start + self.eye_width
-                delta = (
-                    blended_fisheye_sbs[index, :, :, start:end].float()
-                    - projected_source_sbs[index, :, :, start:end].float()
-                )
-                source_delta = self._sample_eye(
-                    delta,
-                    self.inverse_grid,
-                    preserve_dtype=False,
-                )
-                output[index, :, :, start:end].add_(source_delta)
-        output = output.round_().clamp_(0, 255).to(source_sbs.dtype)
-        return output[0] if single else output
-
-    @torch.inference_mode()
-    def inverse_mask_sbs(self, masks: torch.Tensor) -> torch.Tensor:
-        single = masks.ndim == 2
-        if single:
-            masks = masks.unsqueeze(0)
-        if masks.ndim != 3:
-            raise ValueError(
-                f"Expected (H,W) or (N,H,W), got {tuple(masks.shape)}"
-            )
-        expected = (self.height, self.eye_width * 2)
-        if masks.shape[-2:] != expected:
-            raise ValueError(
-                f"SBS mask size {tuple(masks.shape[-2:])} does not match {expected}"
-            )
-        output = torch.empty_like(masks, dtype=torch.bool)
-        for index in range(masks.shape[0]):
-            for eye_index in range(2):
-                start = eye_index * self.eye_width
-                end = start + self.eye_width
-                sampled = F.grid_sample(
-                    masks[index : index + 1, :, start:end]
-                    .unsqueeze(1)
-                    .float(),
-                    self.inverse_grid,
-                    mode="bilinear",
-                    padding_mode="zeros",
-                    align_corners=False,
-                )
-                output[index, :, start:end] = sampled[0, 0] > 0.5
-        return output[0] if single else output

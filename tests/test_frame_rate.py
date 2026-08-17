@@ -18,11 +18,12 @@ from jasna.media.video_decoder import NvidiaVideoReader
     ],
 )
 def test_standard_high_frame_rates_are_halved_exactly(source: Fraction, target: Fraction):
-    retarget = resolve_frame_rate_retarget(source, enabled=True)
+    retarget = resolve_frame_rate_retarget(source, enabled=True, measured_fps=float(source))
 
     assert retarget.active is True
     assert retarget.frame_stride == 2
     assert retarget.output_fps == target
+    assert retarget.rate_mismatch is False
 
 
 @pytest.mark.parametrize(
@@ -36,15 +37,35 @@ def test_standard_high_frame_rates_are_halved_exactly(source: Fraction, target: 
     ],
 )
 def test_other_frame_rates_are_unchanged(source: Fraction):
-    retarget = resolve_frame_rate_retarget(source, enabled=True)
+    retarget = resolve_frame_rate_retarget(source, enabled=True, measured_fps=float(source))
 
     assert retarget.active is False
     assert retarget.frame_stride == 1
     assert retarget.output_fps == source
 
 
+def test_near_standard_container_rate_is_halved_exactly():
+    """ffprobe reports 19001/317 for 59.94 fps footage whose timestamps drift off the grid."""
+    source = Fraction(19_001, 317)
+
+    retarget = resolve_frame_rate_retarget(source, enabled=True, measured_fps=59.94)
+
+    assert retarget.active is True
+    assert retarget.frame_stride == 2
+    assert retarget.output_fps == Fraction(19_001, 634)
+    assert retarget.rate_mismatch is False
+
+
+@pytest.mark.parametrize("source", [Fraction(50, 1), Fraction(120, 1), Fraction(30, 1)])
+def test_rates_outside_the_tolerance_are_not_halved(source: Fraction):
+    retarget = resolve_frame_rate_retarget(source, enabled=True, measured_fps=float(source))
+
+    assert retarget.active is False
+    assert retarget.output_fps == source
+
+
 def test_disabled_retarget_keeps_60_fps():
-    retarget = resolve_frame_rate_retarget(Fraction(60, 1), enabled=False)
+    retarget = resolve_frame_rate_retarget(Fraction(60, 1), enabled=False, measured_fps=60.0)
 
     assert retarget.active is False
     assert retarget.output_fps == Fraction(60, 1)
@@ -52,8 +73,45 @@ def test_disabled_retarget_keeps_60_fps():
 
 @pytest.mark.parametrize(("source_count", "output_count"), [(0, 0), (1, 1), (4, 2), (5, 3)])
 def test_output_frame_count_keeps_first_and_even_indexed_frames(source_count, output_count):
-    retarget = resolve_frame_rate_retarget(Fraction(60, 1), enabled=True)
+    retarget = resolve_frame_rate_retarget(Fraction(60, 1), enabled=True, measured_fps=60.0)
     assert retarget.output_frame_count(source_count) == output_count
+
+
+def test_doubled_container_rate_is_not_retargeted():
+    """NHDTB-634.mp4 from issue #248: r_frame_rate says 59.94, frames arrive at 29.98."""
+    retarget = resolve_frame_rate_retarget(
+        Fraction(60_000, 1_001), enabled=True, measured_fps=29.9803
+    )
+
+    assert retarget.active is False
+    assert retarget.frame_stride == 1
+    assert retarget.output_fps == Fraction(60_000, 1_001)
+    assert retarget.rate_mismatch is True
+
+
+def test_measured_rate_close_to_the_container_rate_still_retargets():
+    retarget = resolve_frame_rate_retarget(
+        Fraction(60_000, 1_001), enabled=True, measured_fps=59.93
+    )
+
+    assert retarget.frame_stride == 2
+    assert retarget.output_fps == Fraction(30_000, 1_001)
+    assert retarget.rate_mismatch is False
+
+
+def test_unknown_measured_rate_trusts_the_container_rate():
+    retarget = resolve_frame_rate_retarget(Fraction(60, 1), enabled=True, measured_fps=0.0)
+
+    assert retarget.frame_stride == 2
+    assert retarget.output_fps == Fraction(30, 1)
+    assert retarget.rate_mismatch is False
+
+
+def test_rate_mismatch_is_not_reported_for_rates_that_are_never_halved():
+    retarget = resolve_frame_rate_retarget(Fraction(24, 1), enabled=True, measured_fps=12.0)
+
+    assert retarget.active is False
+    assert retarget.rate_mismatch is False
 
 
 def test_reader_selects_every_second_decoded_frame_before_batching():
@@ -82,7 +140,7 @@ def test_reader_rejects_invalid_frame_stride():
         )
 
 
-def test_reader_rejects_seek_with_strided_selection():
+def test_strided_selection_reanchors_at_the_first_frame_after_seek():
     reader = NvidiaVideoReader(
         "unused.mp4",
         batch_size=4,
@@ -90,6 +148,8 @@ def test_reader_rejects_seek_with_strided_selection():
         metadata=SimpleNamespace(),
         frame_stride=2,
     )
+    frames = [SimpleNamespace(pts=pts) for pts in range(31, 38)]
 
-    with pytest.raises(ValueError, match="anchored to the start of the file"):
-        next(reader.frames(seek_ts=1.0))
+    selected = list(reader._selected_frames(iter(frames)))
+
+    assert [frame.pts for frame in selected] == [31, 33, 35, 37]

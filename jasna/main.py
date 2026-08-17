@@ -15,12 +15,127 @@ from jasna.os_utils import (
     check_supported_gpu,
     check_windows_nvidia_sysmem_fallback_policy,
 )
+from jasna.session_config import SessionConfig
+
+
+def _session_config_from_args(
+    args: argparse.Namespace,
+    *,
+    codec: str,
+    encoder_settings: dict[str, object],
+    detection_model_name: str,
+    detection_model_path: Path,
+    restoration_model_path: Path,
+    lut_path: str | None,
+) -> SessionConfig:
+    from jasna.mosaic.detection_registry import recommended_score_threshold
+
+    threshold = args.detection_score_threshold
+    if threshold is None:
+        threshold = recommended_score_threshold(detection_model_name)
+    return SessionConfig(
+        device=str(args.device),
+        fp16=bool(args.fp16),
+        batch_size=int(args.batch_size),
+        detection_model_name=detection_model_name,
+        detection_model_path=detection_model_path,
+        detection_score_threshold=float(threshold),
+        max_detection_gap=int(args.max_detection_gap),
+        min_detection_duration=int(args.min_detection_duration),
+        scene_detection=bool(args.scene_detection),
+        restoration_model_path=restoration_model_path,
+        compile_basicvsrpp=bool(args.compile_basicvsrpp),
+        max_clip_size=int(args.max_clip_size),
+        temporal_overlap=int(args.temporal_overlap),
+        enable_crossfade=bool(args.enable_crossfade),
+        denoise_strength=str(args.denoise).lower(),
+        denoise_step=str(args.denoise_step).lower(),
+        secondary_restoration=str(args.secondary_restoration).lower(),
+        tvai_ffmpeg_path=str(args.tvai_ffmpeg_path),
+        tvai_model=str(args.tvai_model),
+        tvai_scale=int(args.tvai_scale),
+        tvai_args=str(args.tvai_args),
+        tvai_workers=int(args.tvai_workers),
+        tvai_denoise=bool(args.tvai_denoise),
+        rtx_scale=int(args.rtx_scale),
+        rtx_quality=str(args.rtx_quality).lower(),
+        rtx_denoise=str(args.rtx_denoise).lower(),
+        rtx_deblur=str(args.rtx_deblur).lower(),
+        vr_mode=str(args.vr_mode),
+        codec=codec,
+        encoder_settings=encoder_settings,
+        lut_path=lut_path,
+        sharpen_strength=float(args.sharpen),
+        retarget_high_fps=bool(args.retarget_high_fps),
+        fmp4=bool(args.fmp4),
+        disable_progress=bool(args.no_progress),
+        working_dir=Path(args.working_directory) if args.working_directory else None,
+    )
 
 
 def _path_collision_key(path: Path) -> str:
     absolute = path.resolve(strict=False)
     key = str(absolute)
     return key.casefold() if sys.platform == "win32" else key
+
+
+def _resolve_cli_encoder_settings(
+    raw_settings: str,
+    *,
+    cq: int | None,
+    codec: str,
+    vendor,
+) -> dict[str, object]:
+    from jasna.accelerator import AcceleratorVendor
+    from jasna.media import parse_encoder_settings, validate_encoder_settings
+    from jasna.media.encoder_quality import encoder_cq_spec, validate_encoder_cq
+
+    resolved_vendor = AcceleratorVendor(str(vendor))
+    settings = parse_encoder_settings(raw_settings)
+    cq_aliases = {"cq"}
+    if resolved_vendor is AcceleratorVendor.AMD:
+        cq_aliases.add("qvbr_quality_level")
+    duplicates = sorted(cq_aliases & settings.keys())
+    if len(duplicates) > 1:
+        raise ValueError(
+            "--encoder-settings contains multiple CQ controls: "
+            f"{', '.join(duplicates)}; use only one"
+        )
+    if cq is not None and duplicates:
+        raise ValueError(
+            "--cq conflicts with --encoder-settings "
+            f"{', '.join(duplicates)}; use only one CQ control"
+        )
+
+    if cq is not None:
+        settings["cq"] = validate_encoder_cq(
+            cq,
+            codec=codec,
+            vendor=resolved_vendor,
+        )
+    elif "cq" in settings:
+        validate_encoder_cq(
+            settings["cq"],
+            codec=codec,
+            vendor=resolved_vendor,
+        )
+    elif (
+        resolved_vendor is AcceleratorVendor.AMD
+        and "qvbr_quality_level" in settings
+    ):
+        settings["cq"] = validate_encoder_cq(
+            settings.pop("qvbr_quality_level"),
+            codec=codec,
+            vendor=resolved_vendor,
+        )
+    else:
+        settings["cq"] = encoder_cq_spec(codec, resolved_vendor).default
+
+    return validate_encoder_settings(
+        settings,
+        codec=codec,
+        vendor=resolved_vendor,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -249,15 +364,22 @@ def build_parser() -> argparse.ArgumentParser:
         default=2,
         help=CLI_HELP["tvai_workers"],
     )
+    tvai.add_argument(
+        "--tvai-denoise",
+        default=False,
+        action="store_true",
+        help=CLI_HELP["tvai_denoise"],
+    )
 
     detection = parser.add_argument_group("Detection")
     detection.add_argument(
         "--detection-model",
         type=str,
-        default="rfdetr-v5",
+        default="rfdetr-v6",
         help=(
             "Detection model name. Installed models are discovered from model_weights/; "
-            "zelefans-vr-yolo-v2 is bundled with Jasna "
+            "rfdetr-v6 (fast) and rfdetr-vr-v1 (VR180) are bundled with Jasna, "
+            "rfdetr-v6-large (higher quality) and zelefans-vr-yolo-v2 are optional downloads "
             "(default: %(default)s)"
         ),
     )
@@ -270,8 +392,26 @@ def build_parser() -> argparse.ArgumentParser:
     detection.add_argument(
         "--detection-score-threshold",
         type=float,
-        default=0.25,
+        default=None,
         help=CLI_HELP["detection_score_threshold"],
+    )
+    detection.add_argument(
+        "--max-detection-gap",
+        type=int,
+        default=2,
+        help=CLI_HELP["max_detection_gap"],
+    )
+    detection.add_argument(
+        "--min-detection-duration",
+        type=int,
+        default=2,
+        help=CLI_HELP["min_detection_duration"],
+    )
+    detection.add_argument(
+        "--scene-detection",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help=CLI_HELP["scene_detection"],
     )
 
     projection = parser.add_argument_group("VR projection")
@@ -316,6 +456,12 @@ def build_parser() -> argparse.ArgumentParser:
         help=CLI_HELP["codec"],
     )
     encoding.add_argument(
+        "--cq",
+        type=int,
+        default=None,
+        help=CLI_HELP["cq"],
+    )
+    encoding.add_argument(
         "--encoder-settings",
         type=str,
         default="",
@@ -328,11 +474,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to a .cube color LUT (1D or 3D) applied on GPU before encoding.",
     )
     encoding.add_argument(
+        "--sharpen",
+        type=float,
+        default=0.0,
+        help=(
+            "Sharpen the picture on GPU before encoding, from 0 (off) to 1 "
+            "(strongest). Matches the ffmpeg cas filter."
+        ),
+    )
+    encoding.add_argument(
         "--retarget-high-fps",
         action="store_true",
         help=(
             "For offline exports, map 60 fps to 30 fps and 59.94 fps to 29.97 fps "
             "by processing every second frame. Other source rates are unchanged."
+        ),
+    )
+    encoding.add_argument(
+        "--fmp4",
+        action="store_true",
+        help=(
+            "Write .mp4/.mov output as fragmented MP4, so the file can be played "
+            "while processing runs and stays playable after an interruption. "
+            "Not available with --stream or --segments."
         ),
     )
     encoding.add_argument(
@@ -358,6 +522,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default="",
         help="Shell command to run when --post-export-action=command.",
+    )
+    post_export.add_argument(
+        "--post-export-video-command",
+        type=str,
+        default="",
+        help=CLI_HELP["post_export_video_command"],
     )
 
     benchmark_group = parser.add_argument_group("Benchmark")
@@ -393,8 +563,16 @@ def main() -> None:
     is_streaming = bool(args.stream)
     if is_streaming and args.retarget_high_fps:
         parser.error("--retarget-high-fps is only supported for offline exports")
-    from jasna.post_export_action import validate_post_export_action, run_post_export_action_safely
+    if is_streaming and args.fmp4:
+        parser.error("--fmp4 is only supported for offline exports")
+    from jasna.post_export_action import (
+        PostExportVideoCommandError,
+        run_post_export_action_safely,
+        run_post_export_video_command,
+        validate_post_export_action,
+    )
     validate_post_export_action(str(args.post_export_action), str(args.post_export_command))
+    post_export_video_command = str(args.post_export_video_command).strip()
 
     def _run_post_export_action() -> None:
         run_post_export_action_safely(
@@ -453,7 +631,6 @@ def main() -> None:
     import torch
 
     from jasna.pipeline import Pipeline
-    from jasna.media import parse_encoder_settings, validate_encoder_settings
 
     input_video = Path(args.input) if args.input else None
     if input_video is not None and not input_video.exists():
@@ -472,6 +649,8 @@ def main() -> None:
             parser.error("--segments requires a single video input, not an image")
         if input_is_dir:
             parser.error("--segments requires a single video input, not a folder")
+        if args.fmp4:
+            parser.error("--fmp4 cannot be combined with --segments")
 
     folder_videos: list[Path] = []
     folder_output_dir: Path | None = None
@@ -533,6 +712,7 @@ def main() -> None:
     from jasna.mosaic.detection_registry import (
         coerce_detection_model_name,
         discover_available_detection_models,
+        recommended_score_threshold,
         require_detection_model_weights,
     )
 
@@ -600,7 +780,14 @@ def main() -> None:
     if codec not in {"hevc", "h264", "av1"}:
         raise ValueError(f"Unsupported codec: {codec} (supported: hevc, h264, av1)")
 
-    encoder_settings = validate_encoder_settings(parse_encoder_settings(str(args.encoder_settings)), codec=codec)
+    from jasna.accelerator import vendor_for_device
+
+    encoder_settings = _resolve_cli_encoder_settings(
+        str(args.encoder_settings),
+        cq=args.cq,
+        codec=codec,
+        vendor=vendor_for_device(str(args.device)),
+    )
 
     batch_size = int(args.batch_size)
     if batch_size <= 0:
@@ -618,10 +805,25 @@ def main() -> None:
     if temporal_overlap > 0 and (2 * temporal_overlap) >= max_clip_size:
         raise ValueError("--temporal-overlap must satisfy 2*--temporal-overlap < --max-clip-size")
 
-    device = torch.device(str(args.device))
-    from jasna.accelerator import device_context, is_amd_device
+    max_detection_gap = int(args.max_detection_gap)
+    if max_detection_gap < 0:
+        raise ValueError("--max-detection-gap must be >= 0")
+    if max_detection_gap >= max_clip_size:
+        raise ValueError("--max-detection-gap must be < --max-clip-size")
 
-    fp16 = bool(args.fp16)
+    min_detection_duration = int(args.min_detection_duration)
+    if min_detection_duration < 0:
+        raise ValueError("--min-detection-duration must be >= 0")
+    if min_detection_duration >= max_clip_size:
+        raise ValueError("--min-detection-duration must be < --max-clip-size")
+    if not (0.0 <= float(args.sharpen) <= 1.0):
+        raise ValueError("--sharpen must be in [0, 1]")
+
+    device = torch.device(str(args.device))
+    from jasna.accelerator import device_context
+
+    if args.detection_score_threshold is None:
+        args.detection_score_threshold = recommended_score_threshold(detection_model_name)
     detection_score_threshold = float(args.detection_score_threshold)
     if not (0.0 <= detection_score_threshold <= 1.0):
         raise ValueError("--detection-score-threshold must be in [0, 1]")
@@ -629,110 +831,41 @@ def main() -> None:
     if restoration_model_name != "basicvsrpp":
         raise ValueError(f"Unsupported restoration model: {restoration_model_name}")
 
-    from jasna.engine_compiler import EngineCompilationRequest, ensure_engines_compiled
-    from jasna.restorer.basicvsrpp_mosaic_restorer import BasicvsrppMosaicRestorer
-    from jasna.restorer.denoise import DenoiseStep, DenoiseStrength
-    from jasna.restorer.restoration_pipeline import RestorationPipeline
-
-    secondary_name = str(args.secondary_restoration).lower()
-    if is_amd_device(device) and secondary_name != "none":
-        raise ValueError(
-            f"Secondary restoration '{secondary_name}' is not available in the AMD build yet"
-        )
-
     if args.license_email and args.license_key:
         from jasna.protection import license_store
         license_store.set_license(args.license_email, args.license_key)
 
-    compile_result = ensure_engines_compiled(EngineCompilationRequest(
-        device=str(device),
-        fp16=fp16,
-        basicvsrpp=bool(args.compile_basicvsrpp) and not is_amd_device(device),
-        basicvsrpp_model_path=str(restoration_model_path),
-        basicvsrpp_max_clip_size=max_clip_size,
-        detection=True,
+    lut_arg = str(args.lut).strip()
+    if lut_arg and not Path(lut_arg).exists():
+        raise FileNotFoundError(lut_arg)
+
+    config = _session_config_from_args(
+        args,
+        codec=codec,
+        encoder_settings=encoder_settings,
         detection_model_name=detection_model_name,
-        detection_model_path=str(detection_model_path),
-        detection_batch_size=batch_size,
-        unet4x=(secondary_name == "unet-4x"),
-    ))
-    use_tensorrt = compile_result.use_basicvsrpp_tensorrt
+        detection_model_path=detection_model_path,
+        restoration_model_path=restoration_model_path,
+        lut_path=lut_arg or None,
+    )
+
+    from jasna.session_factory import build_pipeline, build_restoration_session
 
     with device_context(device):
-        if secondary_name == "none":
-            secondary_restorer = None
-        elif secondary_name == "tvai":
-            from jasna.restorer.tvai_secondary_restorer import TvaiSecondaryRestorer
-            tvai_args_str = f"model={args.tvai_model}:scale={args.tvai_scale}:{args.tvai_args}"
-            secondary_restorer = TvaiSecondaryRestorer(
-                ffmpeg_path=args.tvai_ffmpeg_path,
-                tvai_args=tvai_args_str,
-                scale=int(args.tvai_scale),
-                num_workers=int(args.tvai_workers),
-            )
-        elif secondary_name == "unet-4x":
-            from jasna.restorer.unet4x_secondary_restorer import Unet4xSecondaryRestorer
-            secondary_restorer = Unet4xSecondaryRestorer(device=device, fp16=fp16)
-        elif secondary_name == "rtx-super-res":
-            from jasna.restorer.rtx_superres_secondary_restorer import RtxSuperresSecondaryRestorer
-            rtx_denoise = str(args.rtx_denoise).lower()
-            rtx_deblur = str(args.rtx_deblur).lower()
-            secondary_restorer = RtxSuperresSecondaryRestorer(
-                device=device,
-                scale=int(args.rtx_scale),
-                quality=str(args.rtx_quality).lower(),
-                denoise=None if rtx_denoise == "none" else rtx_denoise,
-                deblur=None if rtx_deblur == "none" else rtx_deblur,
-            )
-        else:
-            raise ValueError(f"Unsupported secondary restoration: {secondary_name}")
-
-        denoise_strength = DenoiseStrength(str(args.denoise).lower())
-        denoise_step = DenoiseStep(str(args.denoise_step).lower())
-
-        restoration_pipeline = RestorationPipeline(
-            restorer=BasicvsrppMosaicRestorer(
-                checkpoint_path=str(restoration_model_path),
-                device=device,
-                max_clip_size=max_clip_size,
-                use_tensorrt=use_tensorrt,
-                fp16=fp16,
-            ),
-            secondary_restorer=secondary_restorer,
-            denoise_strength=denoise_strength,
-            denoise_step=denoise_step,
+        session = build_restoration_session(
+            config,
+            disable_basicvsrpp_tensorrt=False,
+            log_callback=None,
         )
 
-        lut_arg = str(args.lut).strip()
-        if lut_arg and not Path(lut_arg).exists():
-            raise FileNotFoundError(lut_arg)
-        lut_path = lut_arg or None
-
-        working_dir = Path(args.working_directory) if args.working_directory else None
-
         def _make_pipeline(vid_input: Path, out_path: Path) -> Pipeline:
-            return Pipeline(
-                input_video=vid_input,
-                output_video=out_path,
-                detection_model_name=detection_model_name,
-                detection_model_path=detection_model_path,
-                detection_score_threshold=detection_score_threshold,
-                restoration_pipeline=restoration_pipeline,
-                codec=codec,
-                encoder_settings=encoder_settings,
-                batch_size=batch_size,
-                device=device,
-                max_clip_size=max_clip_size,
-                temporal_overlap=temporal_overlap,
-                enable_crossfade=bool(args.enable_crossfade),
-                vr_mode=str(args.vr_mode),
-                fp16=fp16,
-                disable_progress=args.no_progress,
-                lut_path=lut_path,
-                retarget_high_fps=bool(args.retarget_high_fps),
+            return build_pipeline(
+                config,
+                session,
+                vid_input,
+                out_path,
                 segments=segments,
                 splice_plan=splice_plan,
-                working_dir=working_dir,
             )
 
         video_inputs = folder_videos if input_is_dir else ([input_video] if input_video is not None else [])
@@ -743,6 +876,7 @@ def main() -> None:
             return output_video or vid.with_stem(vid.stem + "_out")
 
         pipeline: Pipeline | None = None
+        post_export_video_failed = False
         try:
             if is_streaming and input_video is None:
                 from jasna.streaming import HlsStreamingServer
@@ -788,8 +922,10 @@ def main() -> None:
                     if input_is_dir:
                         print(f"[{i}/{video_total}] Processing {vid.name} -> {out_path.name}")
                     pipeline = _make_pipeline(vid, out_path)
+                    export_succeeded = False
                     try:
                         pipeline.run()
+                        export_succeeded = True
                     except UnsupportedColorspaceError as e:
                         # In a folder batch, skip the bad file and keep going.
                         print(f"Error processing {vid.name}: {e}")
@@ -798,16 +934,30 @@ def main() -> None:
                     finally:
                         pipeline.close()
                         pipeline = None
+                    if export_succeeded and post_export_video_command:
+                        print(f"Running post-export command for {out_path.name}")
+                        try:
+                            run_post_export_video_command(
+                                post_export_video_command,
+                                vid,
+                                out_path,
+                                lambda: False,
+                            )
+                        except PostExportVideoCommandError as e:
+                            print(f"Error post-processing {vid.name}: {e}")
+                            if not input_is_dir:
+                                sys.exit(1)
+                            post_export_video_failed = True
                 _run_post_export_action()
+                if post_export_video_failed:
+                    sys.exit(1)
         except UnsupportedColorspaceError as e:
             print(f"Error: {e}")
             sys.exit(1)
         finally:
             if pipeline is not None:
                 pipeline.close()
-            restoration_pipeline.restorer.close()
-            if secondary_restorer is not None and hasattr(secondary_restorer, "close"):
-                secondary_restorer.close()
+            session.close()
 
 
 if __name__ == "__main__":

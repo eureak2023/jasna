@@ -102,6 +102,27 @@ class TestBlendBufferBlending:
         result = bb.blend_frame(0, original)
         assert result is original
 
+    def test_blend_skips_the_frame_copy_when_no_result_arrived(self):
+        bb = BlendBuffer(device=torch.device("cpu"), blend_mask_fn=_identity_blend_mask)
+        bb.register_frame(0, {1})
+        original = torch.zeros(3, 8, 8, dtype=torch.uint8)
+
+        result = bb.blend_frame(0, original)
+
+        assert result is original
+
+    def test_blend_copies_when_only_some_tracks_have_results(self):
+        bb = BlendBuffer(device=torch.device("cpu"), blend_mask_fn=_identity_blend_mask)
+        bb.register_frame(0, {1, 2})
+        bb.add_result(_make_sr(track_id=1, start_frame=0, frame_count=1, fill_value=200))
+
+        original = torch.zeros(3, 8, 8, dtype=torch.uint8)
+        result = bb.blend_frame(0, original)
+
+        assert result is not original
+        assert torch.all(result == 200)
+        assert torch.all(original == 0)
+
     def test_result_cleaned_up_after_last_frame(self):
         bb = BlendBuffer(device=torch.device("cpu"), blend_mask_fn=_identity_blend_mask)
         bb.register_frame(0, {1})
@@ -237,6 +258,66 @@ def test_remove_pending_clip_skips_unregistered_frames() -> None:
     bb.register_frame(0, {1})
     bb.remove_pending_clip([0, 99], 1)
     assert bb.is_frame_ready(0)
+
+
+def _vr_sr(enlarged_bbox, frame_shape, fill_value):
+    x1, y1, x2, y2 = enlarged_bbox
+    ch, cw = y2 - y1, x2 - x1
+    patch_size = max(ch, cw)
+    return SecondaryRestoreResult(
+        track_id=1,
+        start_frame=0,
+        frame_count=1,
+        frame_shape=frame_shape,
+        frame_device=torch.device("cpu"),
+        masks=[torch.ones(ch, cw, dtype=torch.bool)],
+        restored_frames=[torch.full((3, RSIZE, RSIZE), fill_value, dtype=torch.uint8)],
+        keep_start=0,
+        keep_end=1,
+        crossfade_weights=None,
+        enlarged_bboxes=[enlarged_bbox],
+        crop_shapes=[(patch_size, patch_size)],
+        pad_offsets=[(0, 0)],
+        resize_shapes=[(patch_size, patch_size)],
+        clip_keep_offset=0,
+    )
+
+
+def test_vr_delta_composite_preserves_pixels_outside_mask() -> None:
+    # With a real region projector and a nontrivial restoration, source pixels
+    # where the blend mask is 0 must survive bit-for-bit — the delta composite
+    # inverse-projects only the restoration change, never the whole patch.
+    from jasna.vr_projection import GnomonicProjector
+
+    enlarged = (4, 4, 28, 24)
+    frame_shape = (32, 64)
+    x1, y1, x2, y2 = enlarged
+    rh, rw = y2 - y1, x2 - x1
+
+    def half_mask_fn(mask_lr, bbox_xyxy, fshape):
+        m = torch.zeros((rh, rw), dtype=torch.float32)
+        m[rh // 2 :, :] = 1.0  # bottom half restored, top half untouched
+        return m
+
+    projector = GnomonicProjector(eye_width=32, height=32, device=torch.device("cpu"))
+    bb = BlendBuffer(
+        device=torch.device("cpu"), blend_mask_fn=half_mask_fn, vr_projector=projector
+    )
+    bb.register_frame(0, {1})
+    bb.add_result(_vr_sr(enlarged, frame_shape, fill_value=255))
+
+    torch.manual_seed(3)
+    original = torch.randint(0, 256, (3, 32, 64), dtype=torch.uint8)
+    blended = bb.blend_frame(0, original)
+
+    top = slice(y1, y1 + rh // 2)
+    bottom = slice(y1 + rh // 2, y2)
+    assert torch.equal(blended[:, top, x1:x2], original[:, top, x1:x2])
+    assert not torch.equal(blended[:, bottom, x1:x2], original[:, bottom, x1:x2])
+    # Everything outside the region is untouched too.
+    outside = original.clone()
+    outside[:, y1:y2, x1:x2] = blended[:, y1:y2, x1:x2]
+    assert torch.equal(blended, outside)
 
 
 def test_apply_blend_skips_out_of_range_frame() -> None:

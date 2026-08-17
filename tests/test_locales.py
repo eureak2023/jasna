@@ -5,7 +5,9 @@ import sys
 
 import pytest
 
+from jasna.accelerator import AcceleratorVendor
 from jasna.gui.locales import TRANSLATIONS
+from jasna.media.encoder_quality import encoder_cq_spec
 
 _FULL_LOCALES = ["zh", "ja"]
 _PLACEHOLDER_RE = re.compile(r"\{(\w+)\}")
@@ -53,6 +55,12 @@ def test_gui_tooltip_lookup_uses_help_table_not_argparse(monkeypatch) -> None:
     assert set(descriptions) == set(GUI_TOOLTIP_KEY_BY_DEST.values())
     assert descriptions["fp16_mode"] == CLI_HELP["fp16"]
     assert descriptions["max_clip_size"] == "Maximum clip size for tracking"
+    assert descriptions["max_detection_gap"] == (
+        "Fill detection dropouts up to N frames when the mosaic reappears at the same spot. 0 disables"
+    )
+    assert descriptions["min_detection_duration"] == (
+        "Drop detections shorter than N frames as false positives. 0 disables"
+    )
 
 
 @pytest.mark.parametrize("lang", _FULL_LOCALES)
@@ -118,11 +126,16 @@ _POST_EXPORT_KEYS = {
     "post_export_shutdown",
     "post_export_command",
     "post_export_command_placeholder",
+    "post_export_video_command",
+    "post_export_video_command_placeholder",
     "tip_post_export_action",
+    "tip_post_export_video_command",
     "error_post_export_command_required",
 }
 
 _FRAME_RATE_KEYS = {"retarget_high_fps", "tip_retarget_high_fps"}
+
+_FMP4_KEYS = {"fmp4", "tip_fmp4"}
 
 _SEGMENT_EDITOR_KEYS = {
     "segments_full_video",
@@ -240,6 +253,12 @@ def test_all_languages_define_frame_rate_retarget_keys(lang: str) -> None:
 
 
 @pytest.mark.parametrize("lang", sorted(TRANSLATIONS))
+def test_all_languages_define_fmp4_keys(lang: str) -> None:
+    missing = _FMP4_KEYS - TRANSLATIONS[lang].keys()
+    assert not missing, f"{lang} missing fmp4 keys: {sorted(missing)}"
+
+
+@pytest.mark.parametrize("lang", sorted(TRANSLATIONS))
 def test_all_languages_define_segment_editor_keys(lang: str) -> None:
     missing = _SEGMENT_EDITOR_KEYS - TRANSLATIONS[lang].keys()
     assert not missing, f"{lang} missing segment-editor keys: {sorted(missing)}"
@@ -278,13 +297,19 @@ def test_codec_tooltip_covers_all_three_codecs(lang: str) -> None:
 
 
 @pytest.mark.parametrize("lang", sorted(TRANSLATIONS))
-def test_cq_tooltip_mentions_codec_relative_values(lang: str) -> None:
+def test_cq_tooltip_mentions_literal_native_values(lang: str) -> None:
     tip = TRANSLATIONS[lang].get("tip_encoder_cq")
     if tip is None:
         pytest.skip(f"{lang} has no tip_encoder_cq override")
     assert "CQ" in tip
     assert "AV1" in tip
-    assert "29" in tip
+    # Quoted defaults and ranges must track the shared native CQ specification.
+    for vendor in (AcceleratorVendor.NVIDIA, AcceleratorVendor.AMD):
+        for codec in ("h264", "hevc", "av1"):
+            spec = encoder_cq_spec(codec, vendor)
+            assert str(spec.default) in tip
+            assert str(spec.minimum) in tip
+            assert str(spec.maximum) in tip
 
 
 @pytest.mark.parametrize("lang", sorted(TRANSLATIONS))

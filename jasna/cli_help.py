@@ -16,19 +16,33 @@ CLI_HELP: dict[str, str] = {
     "denoise_step": "When to apply denoising: after_primary (before secondary) or after_secondary (right before blend). (default: %(default)s)",
     "secondary_restoration": "Secondary restoration after primary model (default: %(default)s)",
     "vr_mode": (
-        "VR180 handling: auto uses conservative studio/metadata detection; "
-        "sbs processes each eye separately; sbs-fisheye also reprojects each "
-        "eye for detection/restoration and preserves source projection on output. "
-        "(default: %(default)s)"
+        "VR180 SBS handling: auto uses conservative studio/metadata detection and "
+        "routes each mosaic region's restoration projection (raw/fisheye/gnomonic) "
+        "by studio; sbs forces per-eye SBS with the same studio routing; sbs-fisheye "
+        "forces fisheye conditioning for every region. Detection, tracking, and "
+        "blending stay in source coordinates. (default: %(default)s)"
     ),
     "tvai_ffmpeg_path": "Path to Topaz Video ffmpeg.exe (default: %(default)s)",
     "tvai_model": 'Topaz model name for tvai_up (e.g. "iris-2", "prob-4", "iris-3") (default: %(default)s)',
     "tvai_scale": "Topaz tvai_up scale (1=no scale). Output size is 256*scale (default: %(default)s)",
     "tvai_workers": "Number of parallel TVAI ffmpeg workers (default: %(default)s)",
-    "detection_score_threshold": "Detection score threshold (default: %(default)s)",
+    "tvai_denoise": "Apply TVAI Denoise before enhancement.",
+    "detection_score_threshold": "Detection score threshold. When unset, uses the selected model's recommended value (rfdetr-v6: 0.35, rfdetr-v6-large: 0.40).",
+    "max_detection_gap": "Fill detection dropouts up to N frames when the mosaic reappears at the same spot. 0 disables (default: %(default)s)",
+    "min_detection_duration": "Drop detections shorter than N frames as false positives. 0 disables (default: %(default)s)",
+    "scene_detection": "Detect hard scene cuts and end all tracked mosaic clips at the cut, so no clip spans two different shots. (default: %(default)s)",
     "codec": "Offline output video codec (HLS streaming always uses H.264). Default: %(default)s",
-    "encoder_settings": 'Encoder settings, as JSON object or comma-separated key=value pairs (e.g. {"cq":22} or cq=22,rc-lookahead=32)',
+    "cq": (
+        "Literal encoder quality target passed unchanged. Lower values improve "
+        "quality and increase file size. NVIDIA defaults: H.264 25, HEVC 28, "
+        "AV1 35; AMD defaults: H.264 24, HEVC 25, AV1 32."
+    ),
+    "encoder_settings": 'Advanced encoder settings, as a JSON object or comma-separated key=value pairs (e.g. {"rc-lookahead":32} or rc-lookahead=32,bf=4)',
     "post_export_action": "Action to run after all non-streaming exports finish.",
+    "post_export_video_command": (
+        "Shell command to run after each successful video export. Supports "
+        "{input}, {output}, {output_dir}, {output_stem}, and {output_suffix}."
+    ),
 }
 
 
@@ -48,7 +62,12 @@ GUI_TOOLTIP_KEY_BY_DEST: dict[str, str] = {
     "tvai_scale": "tvai_scale",
     "tvai_workers": "tvai_workers",
     "detection_score_threshold": "detection_score_threshold",
+    "max_detection_gap": "max_detection_gap",
+    "min_detection_duration": "min_detection_duration",
+    "scene_detection": "scene_detection",
     "codec": "codec",
+    "cq": "encoder_cq",
     "encoder_settings": "encoder_custom_args",
     "post_export_action": "post_export_action",
+    "post_export_video_command": "post_export_video_command",
 }

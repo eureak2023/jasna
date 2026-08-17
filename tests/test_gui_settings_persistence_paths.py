@@ -106,12 +106,28 @@ def test_preset_manager_persists_frame_rate_retargeting(monkeypatch, tmp_path: P
     assert loaded.retarget_high_fps is True
 
 
+def test_preset_manager_persists_sharpen_strength(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(os_utils.sys, "platform", "win32", raising=False)
+    monkeypatch.setenv("APPDATA", str(tmp_path / "Roaming"))
+
+    mgr = PresetManager()
+    assert mgr.create_preset("Crisp", AppSettings(sharpen_strength=0.45))
+
+    loaded = PresetManager().get_preset("Crisp")
+    assert loaded is not None
+    assert loaded.sharpen_strength == 0.45
+
+
 def test_preset_manager_persists_post_export_action(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(os_utils.sys, "platform", "win32", raising=False)
     monkeypatch.setenv("APPDATA", str(tmp_path / "Roaming"))
 
     mgr = PresetManager()
-    settings = AppSettings(post_export_action="command", post_export_command="echo done")
+    settings = AppSettings(
+        post_export_action="command",
+        post_export_command="echo done",
+        post_export_video_command="remux {output}",
+    )
     assert mgr.create_preset("WithAction", settings)
 
     mgr2 = PresetManager()
@@ -119,6 +135,22 @@ def test_preset_manager_persists_post_export_action(monkeypatch, tmp_path: Path)
     assert loaded is not None
     assert loaded.post_export_action == "command"
     assert loaded.post_export_command == "echo done"
+    assert loaded.post_export_video_command == "remux {output}"
+
+
+def test_preset_manager_resolve_falls_back_to_default(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(os_utils.sys, "platform", "win32", raising=False)
+    monkeypatch.setenv("APPDATA", str(tmp_path / "Roaming"))
+
+    mgr = PresetManager()
+    name, preset = mgr.resolve("DoesNotExist")
+    assert name == "Default"
+    assert preset == AppSettings()
+
+    assert mgr.create_preset("Mine", AppSettings(encoder_cq=30))
+    name, preset = mgr.resolve("Mine")
+    assert name == "Mine"
+    assert preset.encoder_cq == 30
 
 
 def test_preset_manager_saves_and_loads_last_output_pattern(monkeypatch, tmp_path: Path) -> None:

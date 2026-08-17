@@ -1,17 +1,22 @@
 from __future__ import annotations
 
+import tkinter as tk
 from tkinter import TclError
 from unittest.mock import MagicMock
 
 import customtkinter as ctk
 import pytest
 
-from jasna.gui import icons, settings_panel
+from jasna.gui import icons
+from jasna.gui.settings_sections import widgets as settings_widgets
 from jasna.gui.icons import CompactSwitch, NativeIconButton, render_icon, render_toggle
 from jasna.gui.theme import Colors
 
 
-@pytest.mark.parametrize("name", ["create", "delete", "folder", "globe", "reset", "save"])
+@pytest.mark.parametrize(
+    "name",
+    ["create", "delete", "folder", "globe", "play", "reset", "save"],
+)
 def test_gui_icons_render_without_font_glyphs(name: str) -> None:
     image = render_icon(name, 18, Colors.TEXT_PRIMARY)
 
@@ -129,21 +134,19 @@ def test_native_icon_button_keeps_image_and_disabled_state() -> None:
         root.destroy()
 
 
-def test_slider_value_uses_native_label_without_ctk_canvas(monkeypatch) -> None:
-    constructor = MagicMock(return_value=object())
-    monkeypatch.setattr(settings_panel.tk, "Label", constructor)
-    master = object()
+def test_slider_value_uses_native_label_without_ctk_canvas() -> None:
+    try:
+        root = ctk.CTk()
+    except TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
 
-    result = settings_panel.create_slider_value_label(master, "90", 4, Colors.BG_PANEL)
+    try:
+        label = settings_widgets.create_slider_value_label(root, "90", 4, Colors.BG_PANEL)
 
-    assert result is constructor.return_value
-    constructor.assert_called_once_with(
-        master,
-        text="90",
-        foreground=Colors.TEXT_PRIMARY,
-        background=Colors.BG_PANEL,
-        font=(settings_panel.Fonts.FAMILY, -settings_panel.Fonts.SIZE_NORMAL),
-        width=4,
-        borderwidth=0,
-        highlightthickness=0,
-    )
+        assert isinstance(label, tk.Label)
+        assert label.cget("text") == "90"
+        assert label.cget("background") == Colors.BG_PANEL
+        assert int(label.cget("width")) == 4
+        assert label.cget("font") == f"{settings_widgets.Fonts.FAMILY} -{settings_widgets.Fonts.SIZE_NORMAL}"
+    finally:
+        root.destroy()

@@ -16,18 +16,69 @@ from jasna.mosaic.detection_registry import (
     is_rfdetr_model,
     is_yolo_model,
     precompile_detection_engine,
+    recommended_score_threshold,
+    rfdetr_model_config,
     require_detection_model_weights,
 )
 
 
-def test_default_detection_model_is_rfdetr_v5() -> None:
-    assert DEFAULT_DETECTION_MODEL_NAME == "rfdetr-v5"
-    assert "rfdetr-v5" in RFDETR_MODEL_NAMES
+def test_default_detection_model_is_rfdetr_v6() -> None:
+    assert DEFAULT_DETECTION_MODEL_NAME == "rfdetr-v6"
+    assert "rfdetr-v6" in RFDETR_MODEL_NAMES
+    assert "rfdetr-v6-large" in RFDETR_MODEL_NAMES
 
 
-def test_rfdetr_v5_weights_path() -> None:
-    assert detection_model_weights_path("rfdetr-v5") == Path("model_weights/rfdetr-v5.onnx")
-    assert coerce_detection_model_name("rfdetr-v5") == "rfdetr-v5"
+def test_rfdetr_v6_weights_path() -> None:
+    assert detection_model_weights_path("rfdetr-v6") == Path("model_weights/rfdetr-v6.onnx")
+    assert coerce_detection_model_name("rfdetr-v6") == "rfdetr-v6"
+
+
+def test_rfdetr_model_config_per_version() -> None:
+    legacy = rfdetr_model_config("rfdetr-v5")
+    assert (
+        legacy.resolution,
+        legacy.score_threshold,
+        legacy.dynamic_batch,
+        legacy.fixed_batch_size,
+    ) == (768, 0.25, False, 4)
+    fast = rfdetr_model_config("rfdetr-v6")
+    assert (
+        fast.resolution,
+        fast.score_threshold,
+        fast.dynamic_batch,
+        fast.fixed_batch_size,
+    ) == (576, 0.35, True, None)
+    large = rfdetr_model_config("rfdetr-v6-large")
+    assert (
+        large.resolution,
+        large.score_threshold,
+        large.dynamic_batch,
+        large.fixed_batch_size,
+    ) == (768, 0.40, True, None)
+    vr = rfdetr_model_config("rfdetr-vr-v1")
+    assert (
+        vr.resolution,
+        vr.score_threshold,
+        vr.dynamic_batch,
+        vr.fixed_batch_size,
+    ) == (768, 0.40, True, None)
+
+
+def test_rfdetr_model_config_unknown_falls_back_to_dynamic_batch() -> None:
+    config = rfdetr_model_config("rfdetr-custom")
+    assert (
+        config.resolution,
+        config.score_threshold,
+        config.dynamic_batch,
+        config.fixed_batch_size,
+    ) == (768, 0.25, True, None)
+
+
+def test_recommended_score_threshold() -> None:
+    assert recommended_score_threshold("rfdetr-v6") == 0.35
+    assert recommended_score_threshold("rfdetr-v6-large") == 0.40
+    assert recommended_score_threshold("rfdetr-v5") == 0.25
+    assert recommended_score_threshold("lada-yolo-v4") == 0.25
 
 
 def test_lada_yolo_v4_weights_path() -> None:
@@ -196,7 +247,25 @@ def test_precompile_noop_on_cpu() -> None:
 def test_precompile_rfdetr_on_cuda() -> None:
     with patch("jasna.trt.compile_onnx_to_tensorrt_engine") as mock_compile:
         precompile_detection_engine("rfdetr-v5", Path("m.onnx"), 2, torch.device("cuda:0"), True)
-        mock_compile.assert_called_once_with(Path("m.onnx"), torch.device("cuda:0"), batch_size=2, fp16=True, workspace_gb=20)
+        mock_compile.assert_called_once_with(
+            Path("m.onnx"), torch.device("cuda:0"),
+            batch_size=4, fp16=True, workspace_gb=20, dynamic_batch=False,
+        )
+
+
+def test_precompile_rfdetr_v6_uses_requested_dynamic_batch() -> None:
+    with patch("jasna.trt.compile_onnx_to_tensorrt_engine") as mock_compile:
+        precompile_detection_engine(
+            "rfdetr-v6",
+            Path("m.onnx"),
+            8,
+            torch.device("cuda:0"),
+            True,
+        )
+        mock_compile.assert_called_once_with(
+            Path("m.onnx"), torch.device("cuda:0"),
+            batch_size=8, fp16=True, workspace_gb=20, dynamic_batch=True,
+        )
 
 
 def test_precompile_yolo_on_cuda() -> None:
@@ -235,7 +304,28 @@ def test_build_detection_model_rfdetr() -> None:
         )
         mock_rf.assert_called_once()
         mock_yolo.assert_not_called()
-        assert mock_rf.call_args.kwargs["onnx_path"] == Path("rfdetr-v5.onnx")
+        assert mock_rf.call_args.kwargs["weights_path"] == Path("rfdetr-v5.onnx")
+        assert mock_rf.call_args.kwargs["resolution"] == 768
+        assert mock_rf.call_args.kwargs["batch_size"] == 4
+        assert mock_rf.call_args.kwargs["dynamic_batch"] is False
+
+
+def test_build_detection_model_rfdetr_resolution_per_version() -> None:
+    with patch("jasna.mosaic.rfdetr.RfDetrMosaicDetectionModel") as mock_rf:
+        build_detection_model(
+            "rfdetr-v6", Path("rfdetr-v6.onnx"),
+            batch_size=4, device=torch.device("cpu"), score_threshold=0.35, fp16=True,
+        )
+        assert mock_rf.call_args.kwargs["resolution"] == 576
+        assert mock_rf.call_args.kwargs["batch_size"] == 4
+        assert mock_rf.call_args.kwargs["dynamic_batch"] is True
+    with patch("jasna.mosaic.rfdetr.RfDetrMosaicDetectionModel") as mock_rf:
+        build_detection_model(
+            "rfdetr-v6-large", Path("rfdetr-v6-large.onnx"),
+            batch_size=4, device=torch.device("cpu"), score_threshold=0.40, fp16=True,
+        )
+        assert mock_rf.call_args.kwargs["resolution"] == 768
+        assert mock_rf.call_args.kwargs["dynamic_batch"] is True
 
 
 def test_build_detection_model_yolo() -> None:
@@ -258,3 +348,37 @@ def test_build_detection_model_unknown_raises() -> None:
             "nonsense", Path("x"),
             batch_size=1, device=torch.device("cpu"), score_threshold=0.25, fp16=False,
         )
+
+
+def test_rfdetr_weights_suffix_is_vendor_specific(monkeypatch) -> None:
+    import jasna.mosaic.detection_registry as registry
+
+    monkeypatch.setattr(registry, "is_amd_device", lambda: True)
+    assert registry.rfdetr_weights_suffix() == ".pt"
+    assert registry.detection_model_spec("rfdetr-v6").filename == "rfdetr-v6.pt"
+
+    monkeypatch.setattr(registry, "is_amd_device", lambda: False)
+    assert registry.rfdetr_weights_suffix() == ".onnx"
+    assert registry.detection_model_spec("rfdetr-v6").filename == "rfdetr-v6.onnx"
+
+
+def test_build_detection_model_passes_amd_torch_variant(monkeypatch) -> None:
+    with patch("jasna.mosaic.rfdetr.RfDetrMosaicDetectionModel") as mock_rf:
+        build_detection_model(
+            "rfdetr-v6", Path("rfdetr-v6.pt"),
+            batch_size=1, device=torch.device("cpu"), score_threshold=0.35, fp16=True,
+        )
+        assert mock_rf.call_args.kwargs["torch_variant"] == "medium"
+
+
+def test_discover_lists_torch_rfdetr_weights_on_amd(monkeypatch, tmp_path) -> None:
+    import jasna.mosaic.detection_registry as registry
+
+    (tmp_path / "rfdetr-v6.pt").write_bytes(b"pt")
+    (tmp_path / "rfdetr-v6-large.onnx").write_bytes(b"onnx")
+
+    monkeypatch.setattr(registry, "is_amd_device", lambda: True)
+    assert registry.discover_available_detection_models(tmp_path) == ["rfdetr-v6"]
+
+    monkeypatch.setattr(registry, "is_amd_device", lambda: False)
+    assert registry.discover_available_detection_models(tmp_path) == ["rfdetr-v6-large"]

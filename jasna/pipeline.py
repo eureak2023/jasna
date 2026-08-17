@@ -16,6 +16,7 @@ from jasna.frame_queue import FrameQueue
 import psutil
 import torch
 
+from jasna.accelerator import vendor_for_device
 from jasna.media import UnsupportedColorspaceError, get_video_meta_data
 from jasna.media.video_encoder import NvidiaVideoEncoder
 from jasna.media.frame_rate import resolve_frame_rate_retarget
@@ -40,10 +41,10 @@ from jasna.restorer.secondary_restorer import AsyncSecondaryRestorer
 from jasna.segments import SegmentRange
 from jasna.vram_offloader import VramOffloader
 from jasna.vr180 import (
-    FisheyeProjector,
     SbsDetectionAdapter,
     resolve_vr_mode,
 )
+from jasna.vr_projection import build_vr_projector
 
 log = logging.getLogger(__name__)
 
@@ -86,13 +87,19 @@ class Pipeline:
         device: torch.device,
         max_clip_size: int,
         temporal_overlap: int,
+        max_detection_gap: int,
+        min_detection_duration: int,
         enable_crossfade: bool = True,
+        scene_detection: bool = True,
         vr_mode: str = "auto",
+        vr_projection: str = "auto",
         fp16: bool,
         disable_progress: bool = False,
         progress_callback: callable | None = None,
         lut_path: str | Path | None = None,
+        sharpen_strength: float = 0.0,
         retarget_high_fps: bool = False,
+        fmp4: bool = False,
         segments: tuple[SegmentRange, ...] | None = None,
         splice_plan: SplicePlan | None = None,
         working_dir: Path | None = None,
@@ -106,8 +113,12 @@ class Pipeline:
         self.device = device
         self.max_clip_size = int(max_clip_size)
         self.temporal_overlap = int(temporal_overlap)
+        self.max_detection_gap = int(max_detection_gap)
+        self.min_detection_duration = int(min_detection_duration)
         self.enable_crossfade = bool(enable_crossfade)
+        self.scene_detection = bool(scene_detection)
         self.vr_mode = str(vr_mode)
+        self.vr_projection = str(vr_projection)
 
         self.detection_model = build_detection_model(
             detection_model_name,
@@ -121,18 +132,31 @@ class Pipeline:
         self.disable_progress = bool(disable_progress)
         self.progress_callback = progress_callback
         self.lut_path = lut_path
+        self.sharpen_strength = float(sharpen_strength)
         self.retarget_high_fps = bool(retarget_high_fps)
+        self.fmp4 = bool(fmp4)
         self.segments = tuple(segments) if segments else None
         self.splice_plan = splice_plan
         self._vr_resolution = None
         self._vr_projector = None
         self._job_detection_model = self.detection_model
+        self._cancel_event = threading.Event()
+        self.completed = False
+
+    @property
+    def cancel_requested(self) -> bool:
+        return self._cancel_event.is_set()
+
+    def cancel(self) -> None:
+        """Ask the running pipeline to stop as soon as the worker threads notice."""
+        self._cancel_event.set()
 
     def configure_vr(self, metadata) -> None:
         self._vr_resolution = resolve_vr_mode(
             self.vr_mode,
             metadata,
             self.input_video,
+            projection=self.vr_projection,
         )
         self._job_detection_model = (
             SbsDetectionAdapter(self.detection_model)
@@ -140,12 +164,13 @@ class Pipeline:
             else self.detection_model
         )
         self._vr_projector = (
-            FisheyeProjector(
+            build_vr_projector(
+                self._vr_resolution.projection,
                 eye_width=int(metadata.video_width) // 2,
                 height=int(metadata.video_height),
                 device=self.device,
             )
-            if self._vr_resolution.uses_fisheye
+            if self._vr_resolution.is_sbs
             else None
         )
 
@@ -326,7 +351,11 @@ class Pipeline:
     ) -> None:
         device = self.device
         secondary_workers = max(1, int(self.restoration_pipeline.secondary_num_workers))
-        frame_rate = resolve_frame_rate_retarget(metadata.video_fps_exact, enabled=self.retarget_high_fps)
+        frame_rate = resolve_frame_rate_retarget(
+            metadata.video_fps_exact,
+            enabled=self.retarget_high_fps,
+            measured_fps=metadata.average_fps,
+        )
         if output_frame_count is None:
             output_frame_count = frame_rate.output_frame_count(metadata.num_frames)
 
@@ -336,7 +365,7 @@ class Pipeline:
         metadata_queue: Queue[FrameMeta | object] = Queue(maxsize=self.max_clip_size * 5)
 
         error_holder: list[BaseException] = []
-        blend_buffer = BlendBuffer(device=device)
+        blend_buffer = BlendBuffer(device=device, vr_projector=self._vr_projector)
         crop_buffers: dict[int, CropBuffer] = {}
         crop_lock = threading.Lock()
         primary_idle_event = threading.Event()
@@ -386,6 +415,7 @@ class Pipeline:
                 encode_queue=encode_queue,
                 error_holder=error_holder,
                 debug_memory=debug_memory,
+                cancel_event=self._cancel_event,
             )
 
         threads = [
@@ -398,7 +428,10 @@ class Pipeline:
                     detection_model=self._job_detection_model,
                     max_clip_size=self.max_clip_size,
                     temporal_overlap=self.temporal_overlap,
+                    max_detection_gap=self.max_detection_gap,
+                    min_detection_duration=self.min_detection_duration,
                     enable_crossfade=self.enable_crossfade,
+                    scene_detection=self.scene_detection,
                     blend_buffer=blend_buffer,
                     crop_buffers=crop_buffers,
                     clip_queue=clip_queue,
@@ -416,6 +449,7 @@ class Pipeline:
                     output_fps=float(frame_rate.output_fps),
                     vr_mode=self._vr_resolution.resolved,
                     vr_projector=self._vr_projector,
+                    cancel_event=self._cancel_event,
                 ),
                 name="DecodeDetect", daemon=True,
             ),
@@ -428,6 +462,7 @@ class Pipeline:
                     error_holder=error_holder,
                     primary_idle_event=primary_idle_event,
                     debug_memory=debug_memory,
+                    cancel_event=self._cancel_event,
                 ),
                 name="PrimaryRestore", daemon=True,
             ),
@@ -446,7 +481,7 @@ class Pipeline:
                     vram_offloader=vram_offloader,
                     frame_stride=frame_rate.frame_stride,
                     seek_ts=seek_ts,
-                    vr_projector=self._vr_projector,
+                    cancel_event=self._cancel_event,
                 ),
                 name="BlendEncode", daemon=True,
             ),
@@ -511,6 +546,7 @@ class Pipeline:
         frame_rate = resolve_frame_rate_retarget(
             metadata.video_fps_exact,
             enabled=self.retarget_high_fps,
+            measured_fps=metadata.average_fps,
         )
         if frame_rate.active:
             log.info(
@@ -518,6 +554,13 @@ class Pipeline:
                 frame_rate.source_fps,
                 frame_rate.output_fps,
                 frame_rate.frame_stride,
+            )
+        elif frame_rate.rate_mismatch:
+            log.warning(
+                "Frame-rate retargeting skipped: the container reports %s fps but the measured "
+                "frame rate is %.3f fps; keeping the source rate",
+                frame_rate.source_fps,
+                metadata.average_fps,
             )
         elif self.retarget_high_fps:
             log.info(
@@ -531,6 +574,11 @@ class Pipeline:
             disable=self.disable_progress,
             callback=self.progress_callback,
         )
+        if self.fmp4 and self.output_video.suffix.lower() not in {".mp4", ".mov"}:
+            log.info(
+                "Fragmented MP4 has no effect on %s output; it is already playable while it grows",
+                self.output_video.suffix,
+            )
         encoder_ctx = NvidiaVideoEncoder(
             str(self.output_video),
             device=self.device,
@@ -538,7 +586,9 @@ class Pipeline:
             codec=self.codec,
             encoder_settings=self.encoder_settings,
             lut_path=self.lut_path,
+            sharpen_strength=self.sharpen_strength,
             output_fps=frame_rate.output_fps,
+            fmp4=self.fmp4,
         )
         try:
             self._run_pass(
@@ -570,6 +620,7 @@ class Pipeline:
             metadata,
             index,
             self.encoder_settings,
+            vendor=vendor_for_device(self.device),
         )
         total_frames = max(
             1,
@@ -597,6 +648,8 @@ class Pipeline:
                 fragments: list[tuple[Path, float]] = []
                 fragment_suffix = ".ts" if codec in {"h264", "hevc"} else ".mkv"
                 for span_index, span in enumerate(plan.spans):
+                    if self._cancel_event.is_set():
+                        return
                     raw = temp_dir / f"{span_index:04d}-raw.nut"
                     normalized = temp_dir / f"{span_index:04d}{fragment_suffix}"
                     duration = float((span.end_pts - span.start_pts) * index.time_base)
@@ -608,6 +661,7 @@ class Pipeline:
                             codec=codec,
                             encoder_settings=smart_encoder_settings,
                             lut_path=self.lut_path,
+                            sharpen_strength=self.sharpen_strength,
                             output_fps=metadata.video_fps_exact,
                             mux_audio=False,
                             pts_origin=span.start_pts,
@@ -628,6 +682,8 @@ class Pipeline:
                     normalize_fragment(raw, normalized, codec=codec)
                     fragments.append((normalized, duration))
 
+                if self._cancel_event.is_set():
+                    return
                 assembled = temp_dir / f"assembled{fragment_suffix}"
                 concatenate_fragments(
                     fragments,
@@ -649,9 +705,16 @@ class Pipeline:
         self._validate_metadata(metadata)
         self.configure_vr(metadata)
         if self.segments:
+            if self.fmp4:
+                log.warning(
+                    "Fragmented MP4 is not available with segment processing; "
+                    "the output is assembled after processing finishes"
+                )
+                self.fmp4 = False
             self._run_smart(metadata)
         else:
             self._run_full(metadata)
+        self.completed = not self._cancel_event.is_set()
 
     def run_streaming(
         self,

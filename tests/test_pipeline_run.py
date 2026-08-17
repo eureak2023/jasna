@@ -14,6 +14,7 @@ from jasna.media import VideoMetadata
 from jasna.pipeline import Pipeline
 from jasna.pipeline_items import ClipRestoreItem, FrameMeta, PrimaryRestoreResult, SecondaryRestoreResult, _SENTINEL
 from jasna.restorer.secondary_restorer import AsyncSecondaryRestorer
+from jasna.segments import SegmentRange
 from jasna.tracking.clip_tracker import TrackedClip
 
 
@@ -72,6 +73,8 @@ def _make_pipeline():
             device=torch.device("cuda:0"),
             max_clip_size=60,
             temporal_overlap=8,
+            max_detection_gap=0,
+            min_detection_duration=0,
             fp16=True,
             disable_progress=True,
         )
@@ -169,6 +172,40 @@ class TestPipelineRun:
         assert encoder_cls.call_args.kwargs["output_fps"] == Fraction(30, 1)
         assert progress_cls.call_args.kwargs["total_frames"] == 3
         assert progress_cls.call_args.kwargs["video_fps"] == 30.0
+
+    def test_fmp4_reaches_the_encoder(self):
+        p = _make_pipeline()
+        p.fmp4 = True
+
+        reader_cls, _, _ = _make_two_readers([])
+        mock_encoder = MagicMock()
+        mock_encoder.__enter__ = MagicMock(return_value=mock_encoder)
+        mock_encoder.__exit__ = MagicMock(return_value=False)
+
+        with (
+            patch("jasna.pipeline.get_video_meta_data", return_value=_fake_metadata()),
+            patch("jasna.pipeline_threads.NvidiaVideoReader", reader_cls),
+            patch("jasna.pipeline.NvidiaVideoEncoder", return_value=mock_encoder) as encoder_cls,
+            patch("jasna.pipeline_threads.torch.cuda.set_device"),
+            patch("jasna.pipeline_threads.torch.inference_mode", return_value=MagicMock(__enter__=MagicMock(), __exit__=MagicMock(return_value=False))),
+        ):
+            p.run()
+
+        assert encoder_cls.call_args.kwargs["fmp4"] is True
+
+    def test_fmp4_is_dropped_for_segment_processing(self):
+        p = _make_pipeline()
+        p.fmp4 = True
+        p.segments = (SegmentRange(0.0, 1.0),)
+
+        with (
+            patch("jasna.pipeline.get_video_meta_data", return_value=_fake_metadata()),
+            patch.object(type(p), "_run_smart", MagicMock()) as run_smart,
+        ):
+            p.run()
+
+        run_smart.assert_called_once()
+        assert p.fmp4 is False
 
     def test_run_no_frames(self):
         p = _make_pipeline()
@@ -1036,6 +1073,8 @@ class TestPipelineRun:
                 device=torch.device("cuda:0"),
                 max_clip_size=60,
                 temporal_overlap=8,
+                max_detection_gap=0,
+                min_detection_duration=0,
                 fp16=True,
                 disable_progress=True,
                 progress_callback=cb,

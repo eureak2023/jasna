@@ -9,11 +9,34 @@ import torch
 from jasna.accelerator import is_amd_device, is_nvidia_device
 from jasna.engine_paths import model_weights_dir
 
+
 @dataclass(frozen=True)
 class DetectionModelSpec:
     name: str
     backend: str
     filename: str
+
+
+@dataclass(frozen=True)
+class RfDetrModelConfig:
+    resolution: int
+    score_threshold: float
+    fixed_batch_size: int | None
+    torch_variant: str | None
+
+    @property
+    def dynamic_batch(self) -> bool:
+        return self.fixed_batch_size is None
+
+    def engine_batch_size(self, requested_batch_size: int) -> int:
+        requested_batch_size = int(requested_batch_size)
+        if requested_batch_size <= 0:
+            raise ValueError(
+                f"requested_batch_size must be > 0, got {requested_batch_size}"
+            )
+        if self.fixed_batch_size is not None:
+            return self.fixed_batch_size
+        return requested_batch_size
 
 
 DETECTION_MODEL_SPECS: dict[str, DetectionModelSpec] = {
@@ -34,14 +57,32 @@ DETECTION_MODEL_SPECS: dict[str, DetectionModelSpec] = {
     ),
 }
 
-RFDETR_MODEL_NAMES: frozenset[str] = frozenset({"rfdetr-v2", "rfdetr-v3", "rfdetr-v4", "rfdetr-v5"})
+RFDETR_MODEL_NAMES: frozenset[str] = frozenset(
+    {
+        "rfdetr-v2",
+        "rfdetr-v3",
+        "rfdetr-v4",
+        "rfdetr-v5",
+        "rfdetr-v6",
+        "rfdetr-v6-large",
+        "rfdetr-vr-v1",
+    }
+)
 YOLO_MODEL_NAMES: frozenset[str] = frozenset(
     name
     for name, spec in DETECTION_MODEL_SPECS.items()
     if spec.backend == "yolo"
 )
 
-DEFAULT_DETECTION_MODEL_NAME = "rfdetr-v5"
+DEFAULT_DETECTION_MODEL_NAME = "rfdetr-v6"
+
+RFDETR_MODEL_CONFIGS: dict[str, RfDetrModelConfig] = {
+    "rfdetr-v5": RfDetrModelConfig(768, 0.25, 4, None),
+    "rfdetr-v6": RfDetrModelConfig(576, 0.35, None, "medium"),
+    "rfdetr-v6-large": RfDetrModelConfig(768, 0.40, None, "large"),
+    "rfdetr-vr-v1": RfDetrModelConfig(768, 0.40, None, "large"),
+}
+_RFDETR_FALLBACK_CONFIG = RfDetrModelConfig(768, 0.25, None, None)
 
 YOLO_MODEL_FILES: dict[str, str] = {
     name: spec.filename
@@ -50,6 +91,13 @@ YOLO_MODEL_FILES: dict[str, str] = {
 }
 
 _RFDETR_PATTERN = re.compile(r"^rfdetr-.+$")
+
+
+def rfdetr_weights_suffix() -> str:
+    """AMD runs RF-DETR from the trained torch checkpoint (``.pt``); NVIDIA
+    compiles the ONNX export to TensorRT (``.onnx``). Resolved from the active
+    accelerator vendor — release binaries are vendor-specific."""
+    return ".pt" if is_amd_device() else ".onnx"
 
 
 def is_rfdetr_model(name: str) -> bool:
@@ -70,7 +118,7 @@ def detection_model_spec(name: str) -> DetectionModelSpec:
         return DetectionModelSpec(
             normalized,
             "rfdetr",
-            f"{normalized}.onnx",
+            f"{normalized}{rfdetr_weights_suffix()}",
         )
     valid = sorted(RFDETR_MODEL_NAMES | set(DETECTION_MODEL_SPECS))
     raise ValueError(
@@ -83,8 +131,9 @@ def discover_available_detection_models(weights_dir: Path | None = None) -> list
     rfdetr_names: list[str] = []
     yolo_names: list[str] = []
     if weights_dir.is_dir():
+        rfdetr_suffix = rfdetr_weights_suffix()
         for f in weights_dir.iterdir():
-            if f.suffix == ".onnx" and is_rfdetr_model(f.stem):
+            if f.suffix == rfdetr_suffix and is_rfdetr_model(f.stem):
                 rfdetr_names.append(f.stem)
         yolo_files_reverse = {v: k for k, v in YOLO_MODEL_FILES.items()}
         for f in weights_dir.iterdir():
@@ -105,6 +154,17 @@ def detection_model_choices(weights_dir: Path | None = None) -> list[str]:
 def coerce_detection_model_name(name: str) -> str:
     name = str(name).strip().lower()
     return detection_model_spec(name).name
+
+
+def rfdetr_model_config(name: str) -> RfDetrModelConfig:
+    return RFDETR_MODEL_CONFIGS.get(coerce_detection_model_name(name), _RFDETR_FALLBACK_CONFIG)
+
+
+def recommended_score_threshold(name: str) -> float:
+    coerced = coerce_detection_model_name(name)
+    if is_rfdetr_model(coerced):
+        return rfdetr_model_config(coerced).score_threshold
+    return 0.25
 
 
 def detection_model_weights_path(name: str) -> Path:
@@ -133,12 +193,16 @@ def build_detection_model(
     if is_rfdetr_model(det_name):
         from jasna.mosaic.rfdetr import RfDetrMosaicDetectionModel
 
+        config = rfdetr_model_config(det_name)
         return RfDetrMosaicDetectionModel(
-            onnx_path=detection_model_path,
-            batch_size=int(batch_size),
+            weights_path=detection_model_path,
+            batch_size=config.engine_batch_size(batch_size),
             device=device,
+            resolution=config.resolution,
+            dynamic_batch=config.dynamic_batch,
             score_threshold=float(score_threshold),
             fp16=bool(fp16),
+            torch_variant=config.torch_variant,
         )
     from jasna.mosaic.yolo import YoloMosaicDetectionModel
 
@@ -164,7 +228,15 @@ def precompile_detection_engine(
     if is_rfdetr_model(det_name):
         from jasna.mosaic.rfdetr import compile_rfdetr_engine
 
-        compile_rfdetr_engine(detection_model_path, device, batch_size=int(batch_size), fp16=bool(fp16))
+        config = rfdetr_model_config(det_name)
+        compile_rfdetr_engine(
+            detection_model_path,
+            device,
+            batch_size=config.engine_batch_size(batch_size),
+            resolution=config.resolution,
+            dynamic_batch=config.dynamic_batch,
+            fp16=bool(fp16),
+        )
     elif is_yolo_model(det_name) and is_nvidia_device(device):
         from jasna.mosaic.yolo_tensorrt_compilation import compile_yolo_to_tensorrt_engine
         from jasna.mosaic.yolo import YoloMosaicDetectionModel

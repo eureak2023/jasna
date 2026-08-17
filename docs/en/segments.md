@@ -15,6 +15,9 @@ Open it with the scissors button on any queued video.
   empty to restore the whole video.
 - **Restore preview** shows the current frame or a short playback with your
   current restoration settings, before you commit to processing.
+- Use the visible **− / +** controls or the mouse wheel to zoom into details,
+  then drag the preview to pan. **Reset view** appears only after the view has
+  been changed.
 - When ranges are selected, the export keeps the source video codec — the
   main **Encoding** codec setting does not apply, because unselected parts
   are copied as-is. The editor tells you upfront if a video can't be used
@@ -58,11 +61,13 @@ restored — this is required to splice the video back together seamlessly.
 
 What works with segment processing:
 
-- NVIDIA GPUs only for now.
+- NVIDIA and AMD GPUs.
 - One video at a time (no folders, images, or streaming).
 - H.264, HEVC, or AV1 input with constant frame rate; MP4, MOV, or MKV output.
+- On AMD, H.264 sources with more than three consecutive B-frames are not supported.
 - The output codec always matches the input codec.
 - Cannot be combined with `--retarget-high-fps`.
+- Cannot be combined with `--fmp4`; the output is assembled after processing finishes.
 
 Incompatible input is rejected with a clear error before processing starts.
 

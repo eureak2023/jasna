@@ -64,11 +64,37 @@ def test_unknown_codec_falls_back_to_hevc():
     assert _migrate_preset_dict({"codec": "prores"})["codec"] == "hevc"
 
 
+def test_custom_cq_moves_to_literal_preset_field():
+    migrated = _migrate_preset_dict(
+        {
+            "codec": "h264",
+            "encoder_cq": 28,
+            "encoder_custom_args": "cq=22,rc-lookahead=32",
+        }
+    )
+
+    assert migrated["encoder_cq"] == 22
+    assert parse_encoder_settings(migrated["encoder_custom_args"]) == {
+        "rc-lookahead": 32
+    }
+
+
+def test_amf_quality_alias_moves_to_literal_preset_field():
+    migrated = _migrate_preset_dict(
+        {
+            "codec": "av1",
+            "encoder_custom_args": "qvbr_quality_level=31,g=120",
+        }
+    )
+
+    assert migrated["encoder_cq"] == 31
+    assert parse_encoder_settings(migrated["encoder_custom_args"]) == {"g": 120}
+
+
 def test_gui_codec_label_maps_round_trip():
-    from jasna.gui.settings_panel import (
+    from jasna.gui.settings_sections.encoding import (
         CODEC_CANONICAL_TO_LABEL,
         CODEC_LABEL_TO_CANONICAL,
-        translate_cq_for_codec,
     )
 
     assert set(CODEC_CANONICAL_TO_LABEL) == {"hevc", "h264", "av1"}
@@ -77,8 +103,3 @@ def test_gui_codec_label_maps_round_trip():
         # .lower() on a display label must never be used as the canonical value
         if canonical != "av1":
             assert label.lower() != canonical
-
-    assert translate_cq_for_codec(22, "hevc", "av1") == 29
-    assert translate_cq_for_codec(29, "av1", "hevc") == 22
-    assert translate_cq_for_codec(22, "hevc", "h264") == 22
-    assert translate_cq_for_codec(35, "hevc", "av1") == 35

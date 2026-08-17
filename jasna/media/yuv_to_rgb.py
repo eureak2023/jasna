@@ -1,15 +1,11 @@
 import ctypes
-import os
-import sys
-import threading
-from pathlib import Path
 
 import torch
 
 from av.video.reformatter import Colorspace as AvColorspace
 
-from jasna._frozen import is_frozen
 from jasna.accelerator import is_nvidia_device
+from jasna.media.cuda_kernel import check_cuda, cuda_driver, resolve_function
 
 # YUV->RGB from standard luma coefficients (Kr, Kb):
 #   R = Y' + 2(1-Kr) * V'
@@ -44,95 +40,8 @@ def _rgb_from_yuv_coeffs(name: str) -> tuple[float, float, float, float]:
     )
 
 
-_driver: ctypes.CDLL | None = None
-_driver_lock = threading.Lock()
-_modules: dict[int, ctypes.c_void_p] = {}
 _CUDA_CONVERSION_BATCH = 8
-
-
-def _fatbin_path() -> Path:
-    if is_frozen():
-        return Path(sys.executable).resolve().parent / "yuv_to_rgb.fatbin"
-    return Path(__file__).resolve().with_name("yuv_to_rgb.fatbin")
-
-
-def _cuda_driver() -> ctypes.CDLL:
-    global _driver
-    if _driver is not None:
-        return _driver
-
-    loader = ctypes.WinDLL if os.name == "nt" else ctypes.CDLL
-    lib = loader("nvcuda.dll" if os.name == "nt" else "libcuda.so.1")
-    lib.cuInit.argtypes = [ctypes.c_uint]
-    lib.cuInit.restype = ctypes.c_int
-    lib.cuCtxGetCurrent.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
-    lib.cuCtxGetCurrent.restype = ctypes.c_int
-    lib.cuModuleLoadData.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p]
-    lib.cuModuleLoadData.restype = ctypes.c_int
-    lib.cuModuleGetFunction.argtypes = [
-        ctypes.POINTER(ctypes.c_void_p),
-        ctypes.c_void_p,
-        ctypes.c_char_p,
-    ]
-    lib.cuModuleGetFunction.restype = ctypes.c_int
-    lib.cuLaunchKernel.argtypes = [
-        ctypes.c_void_p,
-        ctypes.c_uint,
-        ctypes.c_uint,
-        ctypes.c_uint,
-        ctypes.c_uint,
-        ctypes.c_uint,
-        ctypes.c_uint,
-        ctypes.c_uint,
-        ctypes.c_void_p,
-        ctypes.POINTER(ctypes.c_void_p),
-        ctypes.POINTER(ctypes.c_void_p),
-    ]
-    lib.cuLaunchKernel.restype = ctypes.c_int
-    lib.cuGetErrorName.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_char_p)]
-    lib.cuGetErrorName.restype = ctypes.c_int
-    lib.cuGetErrorString.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_char_p)]
-    lib.cuGetErrorString.restype = ctypes.c_int
-    _driver = lib
-    return lib
-
-
-def _check_cuda(result: int, operation: str) -> None:
-    if result == 0:
-        return
-    lib = _cuda_driver()
-    name = ctypes.c_char_p()
-    message = ctypes.c_char_p()
-    lib.cuGetErrorName(result, ctypes.byref(name))
-    lib.cuGetErrorString(result, ctypes.byref(message))
-    name_text = name.value.decode(errors="replace") if name.value else f"CUDA error {result}"
-    message_text = message.value.decode(errors="replace") if message.value else "unknown error"
-    raise RuntimeError(f"{operation} failed: {name_text}: {message_text}")
-
-
-def _load_cuda_module() -> ctypes.c_void_p:
-    lib = _cuda_driver()
-    _check_cuda(lib.cuInit(0), "cuInit")
-
-    context = ctypes.c_void_p()
-    _check_cuda(lib.cuCtxGetCurrent(ctypes.byref(context)), "cuCtxGetCurrent")
-    if not context.value:
-        raise RuntimeError("No current CUDA context while loading YUV conversion kernel")
-
-    with _driver_lock:
-        cached = _modules.get(context.value)
-        if cached is not None:
-            return cached
-
-        path = _fatbin_path()
-        try:
-            image = ctypes.create_string_buffer(path.read_bytes())
-        except OSError as exc:
-            raise RuntimeError(f"Missing precompiled YUV conversion kernel: {path}") from exc
-        module = ctypes.c_void_p()
-        _check_cuda(lib.cuModuleLoadData(ctypes.byref(module), image), "cuModuleLoadData")
-        _modules[context.value] = module
-        return module
+_FATBIN = "yuv_to_rgb.fatbin"
 
 
 class _CudaYuvKernel:
@@ -156,23 +65,9 @@ class _CudaYuvKernel:
         )
 
     def _resolve(self) -> ctypes.c_void_p:
-        if self._function is not None:
-            return self._function
-        lib = _cuda_driver()
-        context = ctypes.c_void_p()
-        _check_cuda(lib.cuCtxGetCurrent(ctypes.byref(context)), "cuCtxGetCurrent")
-        if not context.value:
-            raise RuntimeError("No current CUDA context while launching YUV conversion kernel")
-        module = _load_cuda_module()
-        function = ctypes.c_void_p()
-        _check_cuda(
-            lib.cuModuleGetFunction(
-                ctypes.byref(function), module, self.function_name.encode("ascii")
-            ),
-            f"cuModuleGetFunction({self.function_name})",
-        )
-        self._function = function
-        return function
+        if self._function is None:
+            self._function = resolve_function(_FATBIN, self.function_name)
+        return self._function
 
     def launch(self, y: torch.Tensor, uv: torch.Tensor, out: torch.Tensor) -> None:
         self.launch_ptrs(
@@ -226,8 +121,8 @@ class _CudaYuvKernel:
         blocks = (pixels + threads - 1) // threads
         if stream is None:
             stream = torch.cuda.current_stream(out.device).cuda_stream
-        _check_cuda(
-            _cuda_driver().cuLaunchKernel(
+        check_cuda(
+            cuda_driver().cuLaunchKernel(
                 function,
                 blocks,
                 1,
@@ -305,14 +200,23 @@ class YuvToRgbConverter:
             [-b * chroma_scale, -c * chroma_scale],
             [d * chroma_scale, 0.0],
         ]
-        chroma_matrix = [[value / raw_div for value in row] for row in chroma_matrix]
-        offset = [
+        self._chroma_matrix = [[value / raw_div for value in row] for row in chroma_matrix]
+        self._offset = [
             -luma_offset * luma_scale - a * chroma_center * chroma_scale,
             -luma_offset * luma_scale + (b + c) * chroma_center * chroma_scale,
             -luma_offset * luma_scale - d * chroma_center * chroma_scale,
         ]
-        self._chroma_matrix = torch.tensor(chroma_matrix, dtype=torch.float32, device=device)
-        self._offset = torch.tensor(offset, dtype=torch.float32, device=device).view(3, 1, 1)
+        # See jasna/media/yuv_scratch.py for why the eager path allocates its
+        # working set once instead of per frame.
+        self._rgb = torch.empty((3, height, width), dtype=torch.float32, device=device)
+        self._chroma = torch.empty(
+            (3, height // 2, width // 2), dtype=torch.float32, device=device
+        )
+        self._codes = (
+            torch.empty((3, height, width), dtype=torch.int32, device=device)
+            if is_10bit
+            else None
+        )
 
         if is_10bit:
             bayer = torch.tensor(_BAYER8, device=device, dtype=torch.float32)
@@ -355,6 +259,33 @@ class YuvToRgbConverter:
             out,
             stream,
         )
+
+    def convert_surface_into(
+        self,
+        y_ptr: int,
+        uv_ptr: int,
+        pitch: int,
+        out: torch.Tensor,
+        stream: int | None = None,
+    ) -> None:
+        """Convert one NV12/P010 device surface given raw plane pointers.
+
+        Both planes must share ``pitch`` (in bytes), as in a single contiguous
+        NVDEC surface with the chroma plane below the luma plane.
+        """
+        if self._cuda_kernel is None:
+            raise RuntimeError("CUDA surface conversion requires a CUDA converter")
+        bytes_per_sample = 2 if self.is_10bit else 1
+        if pitch % bytes_per_sample:
+            raise ValueError("YUV plane pitch is not aligned to its sample size")
+        if pitch < self.width * bytes_per_sample:
+            raise ValueError("YUV plane pitch is smaller than the visible width")
+        if out.shape != (3, self.height, self.width) or out.dtype != torch.uint8:
+            raise ValueError(f"Unexpected RGB destination: {tuple(out.shape)} {out.dtype}")
+        if not out.is_cuda or out.stride(2) != 1:
+            raise ValueError("RGB destination must be a CUDA tensor with contiguous pixels")
+        stride = pitch // bytes_per_sample
+        self._cuda_kernel.launch_ptr(y_ptr, stride, uv_ptr, stride, out, stream)
 
     def convert_frames_into(
         self, frames: list, out: torch.Tensor, stream: int | None = None
@@ -408,7 +339,10 @@ class YuvToRgbConverter:
         """
         if y.is_cuda:
             if self._cuda_kernel is None:
-                raise RuntimeError("CPU YUV converter cannot process CUDA planes")
+                # AMD/ROCm path: the coefficient tensors already live on the
+                # device, so the eager math runs there directly.
+                self._convert_eager(y, uv, out)
+                return
             expected = torch.uint16 if self.is_10bit else torch.uint8
             if y.dtype != expected or uv.dtype != expected:
                 raise TypeError(
@@ -432,17 +366,25 @@ class YuvToRgbConverter:
 
     def _convert_eager(self, y: torch.Tensor, uv: torch.Tensor, out: torch.Tensor) -> None:
         H, W = self.height, self.width
-        yf = y.to(torch.float32)
-        uvf = uv.to(torch.float32).reshape(-1, 2)
+        u, v = uv[..., 0], uv[..., 1]
 
-        chroma = self._chroma_matrix.mm(uvf.T).reshape(1, 3, H // 2, W // 2)
-        chroma_up = torch.nn.functional.interpolate(chroma, scale_factor=2, mode="nearest")
+        chroma = self._chroma
+        for plane, (cu, cv) in enumerate(self._chroma_matrix):
+            torch.mul(u, cu, out=chroma[plane])
+            chroma[plane].add_(v, alpha=cv)
 
-        rgb = chroma_up.squeeze(0).add_(self._offset)
-        rgb.add_(yf, alpha=self._luma_scale)
+        # Nearest 2x upsample: broadcasting a copy into the split view of the
+        # destination replaces interpolate() and its per-frame allocation.
+        rgb = self._rgb
+        rgb.view(3, H // 2, 2, W // 2, 2).copy_(chroma.unsqueeze(2).unsqueeze(4))
+        for plane, offset in enumerate(self._offset):
+            rgb[plane].add_(offset)
+        rgb.add_(y, alpha=self._luma_scale)
 
         if self.is_10bit:
-            rgb10 = rgb.round_().clamp_(0, 1023).to(torch.int32)
-            out.copy_(((rgb10 + self._dither2) >> 2).clamp_(0, 255))
+            codes = self._codes
+            codes.copy_(rgb.round_().clamp_(0, 1023))
+            codes.add_(self._dither2).bitwise_right_shift_(2).clamp_(0, 255)
+            out.copy_(codes)
         else:
             out.copy_(rgb.round_().clamp_(0, 255))

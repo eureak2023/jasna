@@ -123,7 +123,10 @@ class TestDecodeDetectLoop:
                 detection_model=MagicMock(),
                 max_clip_size=60,
                 temporal_overlap=8,
+                max_detection_gap=0,
+                min_detection_duration=0,
                 enable_crossfade=True,
+                scene_detection=False,
                 blend_buffer=BlendBuffer(device=torch.device("cpu")),
                 crop_buffers={},
                 clip_queue=clip_queue,
@@ -187,7 +190,10 @@ class TestDecodeDetectLoop:
                 detection_model=MagicMock(),
                 max_clip_size=60,
                 temporal_overlap=8,
+                max_detection_gap=0,
+                min_detection_duration=0,
                 enable_crossfade=True,
+                scene_detection=False,
                 blend_buffer=BlendBuffer(device=torch.device("cpu")),
                 crop_buffers={},
                 clip_queue=clip_queue,
@@ -226,7 +232,10 @@ class TestDecodeDetectLoop:
                 detection_model=MagicMock(),
                 max_clip_size=60,
                 temporal_overlap=8,
+                max_detection_gap=0,
+                min_detection_duration=0,
                 enable_crossfade=True,
+                scene_detection=False,
                 blend_buffer=BlendBuffer(device=torch.device("cpu")),
                 crop_buffers={},
                 clip_queue=clip_queue,
@@ -275,7 +284,10 @@ class TestDecodeDetectLoop:
                 detection_model=MagicMock(),
                 max_clip_size=60,
                 temporal_overlap=8,
+                max_detection_gap=0,
+                min_detection_duration=0,
                 enable_crossfade=True,
+                scene_detection=False,
                 blend_buffer=BlendBuffer(device=torch.device("cpu")),
                 crop_buffers={},
                 clip_queue=clip_queue,
@@ -594,22 +606,18 @@ class TestBlendEncodeLoop:
 
         assert len(writer.written) == 1
 
-    def test_vr_delta_projection_runs_only_for_pending_restoration(self):
+    def test_blend_frame_receives_the_source_frame(self):
+        # The per-region VR reprojection now lives inside BlendBuffer, so the
+        # loop simply hands the untouched source frame to blend_frame.
         original = torch.randint(0, 256, (1, 3, 8, 8), dtype=torch.uint8)
-        projected = torch.full_like(original[0], 10)
-        blended_fisheye = torch.full_like(original[0], 20)
-        restored_source = torch.full_like(original[0], 30)
+        blended_out = torch.full_like(original[0], 30)
         reader = _mock_reader([(original, [0])])
         blend_buffer = MagicMock()
         blend_buffer.is_frame_ready.return_value = True
-        blend_buffer.has_pending.return_value = True
-        blend_buffer.blend_frame.return_value = blended_fisheye
+        blend_buffer.blend_frame.return_value = blended_out
         metadata_queue = Queue()
         metadata_queue.put(FrameMeta(frame_idx=0, pts=0))
         metadata_queue.put(_SENTINEL)
-        projector = MagicMock()
-        projector.forward_sbs.return_value = projected
-        projector.restore_delta_to_source.return_value = restored_source
         writer = _RecordingWriter()
 
         with (
@@ -626,54 +634,12 @@ class TestBlendEncodeLoop:
                 metadata_queue=metadata_queue,
                 error_holder=[],
                 frame_writer=writer,
-                vr_projector=projector,
             )
 
-        projector.forward_sbs.assert_called_once()
-        assert torch.equal(projector.forward_sbs.call_args.args[0], original[0])
         blend_buffer.blend_frame.assert_called_once()
         assert blend_buffer.blend_frame.call_args.args[0] == 0
-        assert torch.equal(blend_buffer.blend_frame.call_args.args[1], projected)
-        projector.restore_delta_to_source.assert_called_once()
-        restore_args = projector.restore_delta_to_source.call_args.args
-        assert torch.equal(restore_args[0], original[0])
-        assert torch.equal(restore_args[1], projected)
-        assert torch.equal(restore_args[2], blended_fisheye)
-        assert torch.equal(writer.written[0][0], restored_source)
-
-    def test_vr_projection_is_bypassed_without_pending_restoration(self):
-        original = torch.randint(0, 256, (1, 3, 8, 8), dtype=torch.uint8)
-        reader = _mock_reader([(original, [0])])
-        blend_buffer = MagicMock()
-        blend_buffer.is_frame_ready.return_value = True
-        blend_buffer.has_pending.return_value = False
-        blend_buffer.blend_frame.return_value = original[0]
-        metadata_queue = Queue()
-        metadata_queue.put(FrameMeta(frame_idx=0, pts=0))
-        metadata_queue.put(_SENTINEL)
-        projector = MagicMock()
-        writer = _RecordingWriter()
-
-        with (
-            patch("jasna.pipeline_threads.NvidiaVideoReader", return_value=reader),
-            patch("jasna.pipeline_threads.torch.cuda.set_device"),
-        ):
-            blend_encode_loop(
-                input_video="fake.mkv",
-                batch_size=1,
-                device=torch.device("cpu"),
-                metadata=_fake_metadata(),
-                blend_buffer=blend_buffer,
-                encode_queue=FrameQueue(max_frames=8),
-                metadata_queue=metadata_queue,
-                error_holder=[],
-                frame_writer=writer,
-                vr_projector=projector,
-            )
-
-        projector.forward_sbs.assert_not_called()
-        projector.restore_delta_to_source.assert_not_called()
-        assert torch.equal(writer.written[0][0], original[0])
+        assert torch.equal(blend_buffer.blend_frame.call_args.args[1], original[0])
+        assert torch.equal(writer.written[0][0], blended_out)
 
 
 # ---------------------------------------------------------------------------
@@ -765,6 +731,19 @@ class TestStreamingFrameWriter:
         mock_server.update_production.assert_called_once_with(5)
         mock_server.wait_for_demand.assert_called_once()
 
+    def test_after_write_propagates_encoder_failure(self):
+        from jasna.streaming_pipeline import _StreamingFrameWriter
+        mock_enc = MagicMock()
+        mock_enc.raise_if_failed.side_effect = RuntimeError("writer failed")
+        mock_server = MagicMock()
+        mock_server.frames_per_segment.return_value = 120
+        writer = _StreamingFrameWriter(mock_enc, mock_server, start_segment=5)
+
+        with pytest.raises(RuntimeError, match="writer failed"):
+            writer.after_write(1)
+
+        mock_server.update_production.assert_not_called()
+
     def test_after_write_segment_calculation(self):
         from jasna.streaming_pipeline import _StreamingFrameWriter
         mock_enc = MagicMock()
@@ -815,6 +794,8 @@ class TestRunStreamingPass:
         mock_pipeline = MagicMock()
         mock_pipeline.max_clip_size = 60
         mock_pipeline.temporal_overlap = 8
+        mock_pipeline.max_detection_gap = 0
+        mock_pipeline.min_detection_duration = 0
         mock_pipeline.enable_crossfade = True
         mock_pipeline.batch_size = 2
         mock_pipeline.input_video = "fake.mkv"
@@ -835,7 +816,7 @@ class TestRunStreamingPass:
 
         mock_server = MagicMock()
         mock_server.video_change = threading.Event()
-        mock_server.consume_seek.return_value = None
+        mock_server.consume_seek_for_pass.return_value = None
         mock_server.frames_per_segment.return_value = 120
         mock_enc = MagicMock()
         cancel = threading.Event()
@@ -882,6 +863,8 @@ class TestRunStreamingPass:
         mock_pipeline = MagicMock()
         mock_pipeline.max_clip_size = 60
         mock_pipeline.temporal_overlap = 8
+        mock_pipeline.max_detection_gap = 0
+        mock_pipeline.min_detection_duration = 0
         mock_pipeline.enable_crossfade = True
         mock_pipeline.batch_size = 2
         mock_pipeline.input_video = "fake.mkv"
@@ -902,7 +885,7 @@ class TestRunStreamingPass:
 
         mock_server = MagicMock()
         mock_server.video_change = threading.Event()
-        mock_server.consume_seek.return_value = 10
+        mock_server.consume_seek_for_pass.return_value = 10
         mock_server.frames_per_segment.return_value = 120
         mock_enc = MagicMock()
         cancel = threading.Event()
@@ -1058,6 +1041,31 @@ class TestStreamingLoop:
         assert call_count[0] == 2
         enc.flush_and_restart.assert_called_once_with(start_number=5)
 
+    def test_seek_to_segment_zero_restarts_encoder(self):
+        from jasna.streaming_pipeline import _streaming_loop
+        pipeline, server, enc = self._make_mocks()
+
+        call_count = [0]
+
+        def _fake_pass(**kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return 0
+            server.video_change.set()
+            return None
+
+        with patch("jasna.streaming_pipeline._run_streaming_pass", side_effect=_fake_pass):
+            _streaming_loop(
+                pipeline=pipeline,
+                device=torch.device("cpu"),
+                metadata=MagicMock(),
+                hls_server=server,
+                streaming_encoder=enc,
+            )
+
+        enc.start.assert_called_once_with(start_number=0)
+        enc.flush_and_restart.assert_called_once_with(start_number=0)
+
     def test_completion_then_seek(self):
         from jasna.streaming_pipeline import _streaming_loop
         pipeline, server, enc = self._make_mocks()
@@ -1139,6 +1147,8 @@ class TestPipelineRunStreamingWrapper:
                 device=torch.device("cpu"),
                 max_clip_size=60,
                 temporal_overlap=8,
+                max_detection_gap=0,
+                min_detection_duration=0,
                 fp16=True,
             )
 
