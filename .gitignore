@@ -79,5 +79,6 @@ assets/benchmark/
 
 # ffplay-fsr1 local build / tooling artifacts (not part of jasna source)
 /dist2/
+/build2/
 /jasna_sidecar.log
 /jasna_sidecar.spec

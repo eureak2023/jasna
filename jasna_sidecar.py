@@ -98,7 +98,12 @@ def _pin_bundled_cudnn():
     a permanent "BUFFER" pause.
 
     Fix: put torch/lib FIRST on PATH and drop every other directory that carries a cuDNN,
-    so the bare-name search can only find the matching set."""
+    so the bare-name search can only find the matching set.
+
+    jasna 0.10.0 grew its own version of this (packaging.windows_dll_paths
+    .configure_windows_dll_search_paths, which strips the CUDA_PATH* roots from PATH), but it
+    runs from jasna/__main__.py - an entry point our bundle does not use - and only helps if
+    it runs BEFORE torch is imported, which is the whole point of doing it here instead."""
     import importlib.util
     libdir = ""
     try:
@@ -454,6 +459,15 @@ def main():
     # One binary, two roles: with --model-weights we are ffplay's raw-frame restore sidecar;
     # otherwise we hand off to the normal jasna CLI/GUI (jasna.main), so a single bundle
     # serves both the player sidecar AND standalone jasna (offline / --stream / GUI).
+    # Engine compilation runs out of process: ensure_engines_compiled() re-launches the frozen
+    # exe as `<exe> --compile-engines <json>` (engine_compiler.py). Upstream's own bundle enters
+    # through jasna/__main__.py, which intercepts that argv before argparse ever sees it - ours
+    # enters here, so we must intercept it too or jasna.main dies on "unrecognized arguments"
+    # and every restore pass fails with no engines. Keep in sync with jasna/__main__.py.
+    if len(sys.argv) >= 3 and sys.argv[1] == "--compile-engines":
+        from jasna.engine_compiler import EngineCompilationRequest, _subprocess_compile
+        _subprocess_compile(EngineCompilationRequest.from_json(sys.argv[2]))
+        sys.exit(0)
     if "--model-weights" in sys.argv[1:]:
         run_sidecar()
     else:
