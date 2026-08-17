@@ -5,7 +5,9 @@ emits the restored frames directly — no H.264 re-encode, no HLS, full engine s
 
 Wire format (identical to lada_sidecar.py):
   HEADER = struct("<4sIiidi") = magic 'LADA' | gen u32 | w i32 | h i32 | pts_sec f64 | len i32
-  then len bytes RGB24 (stride w*3). w<0 => READY marker. len==0 => EOF for that gen.
+  then len bytes RGB24 (stride w*3). w==-1 => READY marker, w==-2 => INFO marker (sent as
+  soon as the detection model is known, before the slow load); both carry the detection
+  model name as an ASCII payload. len==0 => EOF for that gen.
 stdin commands: OPEN\t<target>\t<gen>\t<path> | SEEK\t<target>\t<gen> | STOP | QUIT
 
 Runs in jasna's from-source venv (see docs/en/development.md). Decodes through jasna's pyav-hw
@@ -250,6 +252,10 @@ def build_pipeline(device_str, model_weights, max_clip_size, batch_size, tempora
     from jasna.mosaic.detection_registry import rfdetr_model_config
     detection_score_threshold = rfdetr_model_config(detection_model_name).score_threshold
     log(f"detector {detection_model_name} (threshold {detection_score_threshold})")
+    # Announce the model NOW, not at READY: loading it (and compiling engines on a cold
+    # model_weights) takes tens of seconds, and that is exactly when the player is showing
+    # "JASNA LOADING" and the user wants to know which detector it is waiting on.
+    emit(0, -2, -1, 0.0, detection_model_name.encode("ascii", "replace")[:31])   # INFO
     restoration_model_path = mw / "lada_mosaic_restoration_model_generic_v1.2.pth"
 
     log("compiling/loading engines (reuses cached engines in model_weights) ...")
@@ -283,7 +289,7 @@ def build_pipeline(device_str, model_weights, max_clip_size, batch_size, tempora
             retarget_high_fps=False, segments=None, splice_plan=None, working_dir=None,
         )
     log("models loaded")
-    return pipeline, device
+    return pipeline, device, detection_model_name
 
 
 def run_pass(pipeline, device, metadata, gen, seek_ts, cancel_event):
@@ -370,7 +376,7 @@ def run_pass(pipeline, device, metadata, gen, seek_ts, cancel_event):
 class Sidecar:
     def __init__(self, model_weights, device, max_clip_size, batch_size, temporal_overlap, fp16,
                  detection_model=""):
-        self.pipeline, self.device = build_pipeline(
+        self.pipeline, self.device, self.detection_model = build_pipeline(
             device, model_weights, max_clip_size, batch_size, temporal_overlap, fp16,
             detection_model)
         self._path = None
@@ -400,7 +406,10 @@ class Sidecar:
         self._worker.start()
 
     def run(self):
-        emit(0, -1, -1, 0.0, b"")   # READY
+        # READY carries the detection model name as its payload, so the player's status
+        # overlay can name what is actually running. The model is chosen here (it depends on
+        # which weights are installed), so the player cannot know it any other way.
+        emit(0, -1, -1, 0.0, self.detection_model.encode("ascii", "replace")[:31])   # READY
         log("READY")
         stdin = sys.stdin.buffer
         while True:
