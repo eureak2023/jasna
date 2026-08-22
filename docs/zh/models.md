@@ -66,15 +66,39 @@ jasna --input input.mp4 --output output.mkv --secondary-restoration unet-4x
 | RTX Super-Res            | 25秒 / 11.7 GB VRAM | 13秒 / 11.4 GB VRAM |
 | TVAI (2 workers, Iris-2) | 52秒 / 12.1 GB VRAM | 24秒 / 12.4 GB VRAM |
 
-## 静态图像修复（SD 1.5）
+## 静态图像修复
 
-对于静态图像，Jasna 使用微调过的 Stable Diffusion 1.5 inpaint 模型，
-而不是视频流水线。只需把图像加入 GUI 队列（或通过 CLI 传入）— 图像
-任务会自动路由到 SD 1.5:
+对于静态图像，Jasna 不走视频流水线。只需把图像加入 GUI 队列（或通过 CLI
+传入）— 图像任务会自动路由到静态图像路径:
 
 ```bash
 jasna --input photo.png --output restored.png
 ```
+
+共有两种引擎，用 `--image-restoration-model-name`（GUI 图像修复区块中的
+**引擎**）选择:
+
+| 引擎 | 需要 | 方式 |
+| ------ | ----- | -------- |
+| `basicvsrpp`（默认） | 无需额外内容 | 在由该图片构成的静止片段上运行视频修复模型。 |
+| `sd-15-jav` | 下载 6.9 GB + 赞助者许可 | 用微调的扩散模型重绘马赛克（自行编造细节）。 |
+
+### 视频模型（BasicVSR++）
+
+```bash
+jasna --input photo.png --output restored.png
+```
+
+检测、裁剪几何与融合与视频流水线完全一致，只有片段是合成的 —
+由 `--image-clip-size` 张相同图片组成（默认 5），取中间那张修复结果。
+它复用 `model_weights/` 中已有的权重，无需下载、无需填写许可，每张图片
+用时远小于一秒。
+
+由于静态帧没有可融合的相邻帧，这更接近对这一张图片的学习式去马赛克，
+而不是 BasicVSR++ 在视频上的效果。作为交换，它忠于原始画面而不生成新内容。
+提高 `--image-clip-size` 会让循环网络多做几轮细化；约 5 之后差别趋于平缓。
+
+### SD 1.5
 
 - 该模型**未随程序打包**，大小约 **6.9 GB**。Jasna 会在从
   [huggingface.co/Kruk2/sd-15-jav](https://huggingface.co/Kruk2/sd-15-jav)

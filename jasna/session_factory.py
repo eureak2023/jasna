@@ -40,7 +40,12 @@ class RestorationSession:
             self.secondary_restorer.close()
 
 
-def _build_secondary_restorer(config: SessionConfig, device: "torch.device"):
+def build_secondary_restorer(config, device: "torch.device"):
+    """Construct the configured secondary (upscaling) restorer, or None.
+
+    ``config`` only needs the secondary_restoration / tvai_* / rtx_* / fp16
+    attributes, so the still-image path can pass a lightweight stand-in for a
+    full SessionConfig."""
     if config.secondary_restoration == "none":
         return None
     if config.secondary_restoration == "tvai":
@@ -109,7 +114,7 @@ def build_restoration_session(
         log_callback=log_callback,
     )
 
-    secondary_restorer = _build_secondary_restorer(config, device)
+    secondary_restorer = build_secondary_restorer(config, device)
     restoration_pipeline = RestorationPipeline(
         restorer=BasicvsrppMosaicRestorer(
             checkpoint_path=str(config.restoration_model_path),

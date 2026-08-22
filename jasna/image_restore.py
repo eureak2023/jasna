@@ -232,7 +232,11 @@ def restore_image(
 
 def run_image_restoration(args) -> None:
     input_path = Path(args.input)
-    output_base = Path(args.output) if args.output else input_path.with_stem(input_path.stem + "_out")
+    # No --output: restore in place, overwriting the original (jasna.main resolves the
+    # same way for folders). Note --sd15-variants > 1 still spreads to <stem>_v1..N.
+    output_base = Path(args.output) if args.output else input_path
+    if not args.output:
+        print(f"No --output given: overwriting {input_path}")
     _run_image_jobs(args, [(input_path, output_base)])
 
 
@@ -244,21 +248,49 @@ def run_image_restoration_folder(
     output_pattern: str | None = None,
     progress_offset: int = 0,
     progress_total: int | None = None,
+    input_root: Path | None = None,
 ) -> None:
     """Restore every image in ``input_paths``, writing into ``output_dir`` (one
-    shared model load for the whole batch)."""
+    shared model load for the whole batch).
+
+    ``input_root`` mirrors each input's subfolder under ``output_dir`` (recursive
+    batches); without it every output lands directly in ``output_dir``."""
     from jasna.media.media_files import folder_output_path
 
-    jobs = [(Path(p), folder_output_path(output_dir, p, output_pattern)) for p in input_paths]
+    jobs = [
+        (Path(p), folder_output_path(output_dir, p, output_pattern, input_root))
+        for p in input_paths
+    ]
     total = progress_total or len(jobs)
 
     def progress(i: int, input_path: Path, output_base: Path) -> None:
-        print(f"[{progress_offset + i}/{total}] Processing {input_path.name} -> {output_base.name}")
+        # Show the path relative to the batch root so subfolders are visible.
+        label = input_path.name
+        if input_root is not None:
+            try:
+                label = input_path.relative_to(input_root).as_posix()
+            except ValueError:
+                pass
+        print(f"[{progress_offset + i}/{total}] Processing {label} -> {output_base.name}")
 
     _run_image_jobs(args, jobs, progress_callback=progress)
 
 
 def _run_image_jobs(args, jobs: list[tuple[Path, Path]], progress_callback=None) -> None:
+    # --image-restoration-model-name basicvsrpp routes still images through the
+    # video restorer instead of SD 1.5 (no 6.9 GB download, no license).
+    engine = str(getattr(args, "image_restoration_model_name", "basicvsrpp"))
+    if engine == "basicvsrpp":
+        from jasna.image_restore_video import run_image_jobs_video_model
+
+        run_image_jobs_video_model(args, jobs, progress_callback=progress_callback)
+        return
+    if engine == "sd15-custom":
+        from jasna.image_restore_sd15_custom import run_image_jobs_sd15_custom
+
+        run_image_jobs_sd15_custom(args, jobs, progress_callback=progress_callback)
+        return
+
     from jasna.engine_compiler import EngineCompilationRequest, ensure_engines_compiled
     from jasna.engine_paths import SD15_DIR
     from jasna.media import image_io

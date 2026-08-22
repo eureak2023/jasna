@@ -157,7 +157,9 @@ class AppSettings:
     scene_detection: bool = True
     compile_basicvsrpp: bool = True
     
-    # Image restoration (SD 1.5 inpaint; used only for still-image inputs)
+    # Image restoration (used only for still-image inputs)
+    image_restore_model: str = "basicvsrpp"  # basicvsrpp (video model) or sd-15-jav (inpaint)
+    image_restore_clip_size: int = 5  # basicvsrpp only: frames in the synthetic clip
     image_restore_steps: int = 25
     image_restore_strength: float = 0.6
     image_restore_freeu: bool = True

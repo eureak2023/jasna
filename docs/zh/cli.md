@@ -6,11 +6,20 @@ Jasna 的 CLI 与 GUI 功能一致。`jasna --help` 始终显示完整的最新�
 # Single video
 jasna --input input.mp4 --output output.mkv
 
-# Still image (routes to SD 1.5 automatically)
+# Still image (routes to the still-image path automatically)
 jasna --input photo.png --output restored.png
+
+# 不写 --output: 就地覆盖修复图片
+jasna --input photo.png
 
 # Whole folder (images first, then videos)
 jasna --input input_folder --output output_folder
+
+# 含所有子文件夹，就地覆盖
+jasna --input input_folder --recursive
+
+# 混合文件夹: 跳过视频，只就地修复图片
+jasna --input input_folder --recursive --images-only
 ```
 
 在 Windows 上，CLI 与应用是同一个文件: `jasna.exe --input ...`。
@@ -69,13 +78,31 @@ jasna --input input_folder --output output_folder
 | `--tvai-workers` | `2` | 并行的 TVAI ffmpeg 工作进程数。 |
 | `--tvai-denoise` | 关闭 | 在 TVAI 增强处理前应用降噪。 |
 
-## SD 1.5 图像修复
+## 静态图像修复
 
 静态图像会自动路由到这里；`--restoration-model-name` 仅用于视频。
 
 | 选项 | 默认值 | 说明 |
 | ------ | ------- | ----- |
-| `--image-restoration-model-name` | `sd-15-jav` | 目前唯一的值。 |
+| `--image-restoration-model-name` | `basicvsrpp` | `basicvsrpp` 复用 `--restoration-model-path` 的视频修复权重，无需额外下载。`sd-15-jav` 则用微调的 SD 1.5 模型重绘（需单独下载 6.9 GB 并具备赞助者许可）。 |
+| `--image-clip-size` | `5` | 仅 `basicvsrpp`：合成片段的张数，取中间那张。 |
+
+### 视频模型（`basicvsrpp`）
+
+```bash
+jasna --input photo.png --output restored.png
+```
+
+用视频流程同一个 BasicVSR++ 修复模型，在由 N 张相同图片构成的片段上运行。直接使用
+`model_weights/` 中已有的权重，无需下载、无需许可。`--denoise` 同样生效，`--sd15-*` 则被忽略。
+
+单张图片没有可融合的额外信息，因此效果无法与真实视频相比；但它不会生成新内容，更贴近
+原始像素，而且比扩散模型快得多。
+
+### SD 1.5（`sd-15-jav`）
+
+| 选项 | 默认值 | 说明 |
+| ------ | ------- | ----- |
 | `--sd15-steps` | `25` | 扩散步数。 |
 | `--sd15-strength` | `0.6` | SDEdit 去噪强度，限制为 `<= 0.7`。 |
 | `--sd15-freeu` / `--no-sd15-freeu` | 开启 | FreeU UNet 调整。 |

@@ -9,8 +9,17 @@ jasna --input input.mp4 --output output.mkv
 # Still image (routes to SD 1.5 automatically)
 jasna --input photo.png --output restored.png
 
+# --output なし: 画像を上書き復元
+jasna --input photo.png
+
 # Whole folder (images first, then videos)
 jasna --input input_folder --output output_folder
+
+# サブフォルダも含めて上書き復元
+jasna --input input_folder --recursive
+
+# 動画混在フォルダ: 動画は飛ばして画像だけ上書き復元
+jasna --input input_folder --recursive --images-only
 ```
 
 Windows では、CLI もアプリ本体と同じファイルです: `jasna.exe --input ...`。
@@ -69,13 +78,32 @@ Windows では、CLI もアプリ本体と同じファイルです: `jasna.exe -
 | `--tvai-workers` | `2` | 並列で動かす TVAI ffmpeg ワーカー数。 |
 | `--tvai-denoise` | オフ | TVAI の高画質化処理の前にノイズ除去を適用します。 |
 
-## SD 1.5 画像復元
+## 静止画復元
 
 静止画は自動的にここへルーティングされます。`--restoration-model-name` は動画専用です。
 
 | オプション | デフォルト | 説明 |
 | ------ | ------- | ----- |
-| `--image-restoration-model-name` | `sd-15-jav` | 現在唯一の値。 |
+| `--image-restoration-model-name` | `basicvsrpp` | `basicvsrpp` は `--restoration-model-path` の動画復元モデルを再利用します（追加ダウンロード不要）。`sd-15-jav` はファインチューニング済みの SD 1.5 モデルで描き直します（別途 6.9 GB のダウンロードとサポーターライセンスが必要）。 |
+| `--image-clip-size` | `5` | `basicvsrpp` 専用: 合成クリップの枚数。中央の 1 枚を採用します。 |
+
+### 動画モデル（`basicvsrpp`）
+
+```bash
+jasna --input photo.png --output restored.png
+```
+
+動画パイプラインと同じ BasicVSR++ 復元モデルを、同一画像 N 枚から作ったクリップに対して
+実行します。`model_weights/` の重みをそのまま使うため、ダウンロードもライセンスも不要です。
+`--denoise` は有効ですが、`--sd15-*` は無視されます。
+
+1 枚には融合できる追加情報がないため、実際の動画に対する性能には及びません。その代わり
+新しい内容を生成せず、元のピクセルに忠実で、拡散モデルよりはるかに高速です。
+
+### SD 1.5（`sd-15-jav`）
+
+| オプション | デフォルト | 説明 |
+| ------ | ------- | ----- |
 | `--sd15-steps` | `25` | 拡散ステップ数。 |
 | `--sd15-strength` | `0.6` | SDEdit のノイズ除去強度。`<= 0.7` に制限されます。 |
 | `--sd15-freeu` / `--no-sd15-freeu` | オン | FreeU による UNet の調整。 |

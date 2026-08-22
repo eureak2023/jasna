@@ -521,21 +521,24 @@ class Processor:
         self._log("INFO", "Restoration models unloaded")
 
     def _ensure_image_session(self):
-        """Load the rf-detr detector + SD 1.5 restorer once; reused across image jobs."""
+        """Load the rf-detr detector + the image restorer once; reused across image jobs."""
         if self._img_session is not None:
             return
         from jasna._suppress_noise import install as _install_noise_filters
         _install_noise_filters()
         import torch
         from jasna.engine_compiler import EngineCompilationRequest, ensure_engines_compiled
-        from jasna.engine_paths import SD15_DIR
+        from jasna.engine_paths import SD15_DIR, model_weights_dir
         from jasna.mosaic.detection_registry import build_detection_model, coerce_detection_model_name, require_detection_model_weights
         from jasna.restorer.sd15_download import bundle_present
         from jasna.restorer.sd15_inpaint_restorer import Sd15InpaintRestorer
 
         settings = self._settings
         device = torch.device("cuda:0")
-        if not bundle_present(SD15_DIR):
+        use_video_model = str(settings.image_restore_model) == "basicvsrpp"
+        # Same fixed weights the GUI's video path uses (see gui.video_session).
+        video_model_path = str(model_weights_dir() / "lada_mosaic_restoration_model_generic_v1.2.pth")
+        if not use_video_model and not bundle_present(SD15_DIR):
             raise FileNotFoundError(
                 f"SD 1.5 model not found at {SD15_DIR}. Use 'Download model' in the "
                 "Image Restoration settings."
@@ -547,6 +550,9 @@ class Processor:
             EngineCompilationRequest(
                 device=str(device),
                 fp16=settings.fp16_mode,
+                # The video model needs its BasicVSR++ engines too; the SD 1.5 path does not.
+                basicvsrpp=use_video_model and bool(settings.compile_basicvsrpp),
+                basicvsrpp_model_path=video_model_path if use_video_model else "",
                 detection=True,
                 detection_model_name=det_name,
                 detection_model_path=str(detection_model_path),
@@ -562,12 +568,25 @@ class Processor:
             score_threshold=settings.detection_score_threshold,
             fp16=settings.fp16_mode,
         )
-        restorer = Sd15InpaintRestorer(SD15_DIR, device, settings.fp16_mode)
+        if use_video_model:
+            from jasna.engine_paths import all_basicvsrpp_sub_engines_exist
+            from jasna.restorer.basicvsrpp_mosaic_restorer import BasicvsrppMosaicRestorer
+
+            restorer = BasicvsrppMosaicRestorer(
+                checkpoint_path=video_model_path,
+                device=device,
+                max_clip_size=max(1, int(settings.image_restore_clip_size)),
+                use_tensorrt=all_basicvsrpp_sub_engines_exist(video_model_path, settings.fp16_mode),
+                fp16=settings.fp16_mode,
+            )
+            self._log("INFO", "Video restoration model loaded (reused across image jobs)")
+        else:
+            restorer = Sd15InpaintRestorer(SD15_DIR, device, settings.fp16_mode)
+            self._log("INFO", "SD 1.5 model loaded (reused across image jobs)")
         self._img_session = (detector, restorer, device)
-        self._log("INFO", "SD 1.5 model loaded (reused across image jobs)")
 
     def _run_image_job(self, job_id: int, input_path: Path, output_path: Path):
-        """Restore a still image with the (shared) SD 1.5 inpaint session."""
+        """Restore a still image with the (shared) image restoration session."""
         from jasna.image_restore import clamp_strength, restore_image, variant_output_paths
         from jasna.media import image_io
         from jasna.restorer.sd15_inpaint_restorer import DEFAULT_FREEU
@@ -580,6 +599,22 @@ class Processor:
         if self._stop_event.is_set():
             raise ProcessingStopped("Processing stopped")
         self._progress(ProgressUpdate(job_id=job_id, status=JobStatus.PROCESSING, progress=20.0, message="Detecting mosaics"))
+
+        if str(settings.image_restore_model) == "basicvsrpp":
+            from jasna.image_restore_video import restore_image_video_model
+            from jasna.restorer.denoise import DenoiseStrength
+
+            img = image_io.read_image_rgb_chw(input_path)
+            out = restore_image_video_model(
+                img, detector, restorer,
+                device=device,
+                clip_size=max(1, int(settings.image_restore_clip_size)),
+                denoise_strength=DenoiseStrength(str(settings.denoise_strength).lower()),
+            )
+            image_io.write_image_rgb_chw(output_path, out)
+            self._log("INFO", f"Wrote {output_path.name}")
+            self._progress(ProgressUpdate(job_id=job_id, status=JobStatus.PROCESSING, progress=100.0))
+            return
 
         num_variants = max(1, int(settings.image_restore_variants))
         freeu = dict(DEFAULT_FREEU) if bool(settings.image_restore_freeu) else None

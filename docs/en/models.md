@@ -72,15 +72,43 @@ variables to your Topaz Video model folders, as shown below
 | RTX Super-Res            | 25s / 11.7 GB VRAM | 13s / 11.4 GB VRAM |
 | TVAI (2 workers, Iris-2) | 52s / 12.1 GB VRAM | 24s / 12.4 GB VRAM |
 
-## Still-image restoration (SD 1.5)
+## Still-image restoration
 
-For still images, Jasna uses a fine-tuned Stable Diffusion 1.5 inpaint model
-instead of the video pipeline. Just add an image to the GUI queue (or pass it
-on the CLI) — image jobs route to SD 1.5 automatically:
+For still images Jasna does not run the video pipeline. Just add an image to the
+GUI queue (or pass it on the CLI) — image jobs route to the still-image path
+automatically:
 
 ```bash
 jasna --input photo.png --output restored.png
 ```
+
+Two engines are available, picked with `--image-restoration-model-name`
+(**Engine** in the GUI's Image Restoration section):
+
+| Engine | Needs | Approach |
+| ------ | ----- | -------- |
+| `basicvsrpp` (default) | nothing extra | Runs the video restoration model on a static clip built from the image. |
+| `sd-15-jav` | 6.9 GB download + supporter licence | Inpaints the mosaic with a fine-tuned diffusion model — invents plausible detail. |
+
+### Video model (BasicVSR++)
+
+```bash
+jasna --input photo.png --output restored.png
+```
+
+Detection, crop geometry and blending are exactly the video pipeline's; only the
+clip is synthetic — `--image-clip-size` copies of the image (default 5), of which
+the middle restored frame is kept. It reuses the weights already in
+`model_weights/`, so there is nothing to download and no licence to enter, and it
+finishes in well under a second per image.
+
+Because a still frame has no neighbouring frames to fuse, this is closer to a
+learned de-mosaic of that one image than to what BasicVSR++ achieves on video.
+In exchange it stays faithful to the source instead of generating new content.
+Raising `--image-clip-size` gives the recurrent network a few more refinement
+passes; the difference flattens out past about 5.
+
+### SD 1.5
 
 - The model is **not bundled** and is about **6.9 GB**. Jasna asks before
   downloading it from
@@ -99,7 +127,7 @@ jasna --input photo.png --output restored.png --sd15-variants 4
 ```
 
 Every knob (`--sd15-steps`, `--sd15-strength`, `--sd15-seed`, ...) is listed
-in the [CLI reference](cli.md#sd-15-image-restoration).
+in the [CLI reference](cli.md#sd-15-sd-15-jav).
 
 Examples:
 [SD 1.5 examples on SLS Discord](https://discord.com/channels/1196376491815092265/1199059436199759943/1492139124348420106)

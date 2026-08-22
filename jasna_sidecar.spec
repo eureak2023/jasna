@@ -34,9 +34,15 @@ hiddenimports += collect_submodules('jasna')
 
 # customtkinter/tkinterdnd2 let the same bundle also run the jasna CLI/GUI (jasna.main),
 # so one bundle serves both the ffplay sidecar and standalone jasna (no separate jasna_cli).
+# nvvfx is the NVIDIA Video Effects runtime behind --secondary-restoration
+# rtx-super-res (the only secondary upscaler that needs no supporter licence).
+# Its 17 DLLs live in nvvfx\libs and weigh ~792 MB; without them the option dies
+# with "Cannot find nvCVImage DLL or its dependencies". _lib_loader resolves them
+# as Path(__file__).parent/"libs", which collect_all maps correctly under
+# _internal, so no bundle-root copy is needed (unlike the fatbins above).
 for pkg in ('torch', 'torchvision', 'ultralytics', 'cv2', 'av', 'jasna',
             'tensorrt', 'tensorrt_libs', 'tensorrt_bindings', 'torch_tensorrt',
-            'onnxruntime', 'customtkinter', 'tkinterdnd2'):
+            'onnxruntime', 'customtkinter', 'tkinterdnd2', 'nvvfx'):
     d, b, h = collect_all(pkg)
     datas += d; binaries += b; hiddenimports += h
 

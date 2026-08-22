@@ -17,6 +17,10 @@ from jasna.os_utils import (
 )
 from jasna.session_config import SessionConfig
 
+# Mirrors jasna.image_restore_video.DEFAULT_IMAGE_CLIP_SIZE; duplicated so that
+# building the parser does not drag torch in.
+IMAGE_CLIP_SIZE_DEFAULT = 5
+
 
 def _session_config_from_args(
     args: argparse.Namespace,
@@ -161,6 +165,24 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--images-only",
+        action="store_true",
+        help=(
+            "Folder input: process the images and skip every video. Lets a mixed folder "
+            "be restored in place, which video cannot be (it is read while being written)."
+        ),
+    )
+    parser.add_argument(
+        "--recursive",
+        "-r",
+        action="store_true",
+        help=(
+            "Folder input: also process media in subfolders, at any depth. Each output "
+            "keeps its subfolder (mirrored under --output), so same-named files in "
+            "different subfolders never collide. Off by default."
+        ),
+    )
+    parser.add_argument(
         "--working-directory",
         type=str,
         default=None,
@@ -244,18 +266,78 @@ def build_parser() -> argparse.ArgumentParser:
     secondary.add_argument(
         "--secondary-restoration",
         type=str,
-        default="none",
+        default=None,  # resolved after parsing: "rtx-super-res" under --images-only, else "none"
         choices=["none", "unet-4x", "tvai", "rtx-super-res"],
-        help=CLI_HELP["secondary_restoration"],
+        help=(
+            CLI_HELP["secondary_restoration"]
+            + " Defaults to none, except with --images-only where rtx-super-res is applied"
+            " automatically; pass --secondary-restoration none there to opt out."
+        ),
     )
 
-    sd15 = parser.add_argument_group("SD 1.5 image restoration")
+    sd15 = parser.add_argument_group("Still image restoration")
     sd15.add_argument(
         "--image-restoration-model-name",
         type=str,
-        default="sd-15-jav",
-        choices=["sd-15-jav"],
-        help="Restoration model for still-image input (image-only). Images auto-route here; no need to set --restoration-model-name.",
+        default="basicvsrpp",
+        choices=["sd-15-jav", "basicvsrpp", "sd15-custom"],
+        help=(
+            "Restoration model for still-image input (image-only). Images auto-route here; "
+            'no need to set --restoration-model-name. "basicvsrpp" reuses the video restoration '
+            "weights already on disk (--restoration-model-path) on a static clip built from the "
+            'image - nothing extra to install. "sd-15-jav" inpaints with the fine-tuned SD 1.5 '
+            "model instead (separate 6.9 GB download, supporter licence). \"sd15-custom\" runs any "
+            "SD 1.5 *inpainting* checkpoint you supply with --image-model-path. Default: %(default)s"
+        ),
+    )
+    sd15.add_argument(
+        "--image-model-path",
+        type=str,
+        default="",
+        help=(
+            "sd15-custom only: path to an SD 1.5 inpainting checkpoint (.safetensors). Must be an "
+            "inpainting variant (9-channel UNet); a regular model is rejected with a clear error."
+        ),
+    )
+    sd15.add_argument(
+        "--image-lora-path",
+        type=str,
+        default="",
+        help="sd15-custom only: optional LoRA (.safetensors) fused into the pipeline.",
+    )
+    sd15.add_argument(
+        "--image-lora-scale",
+        type=float,
+        default=1.0,
+        help="sd15-custom only: LoRA strength (default: %(default)s). Negative values are allowed.",
+    )
+    sd15.add_argument(
+        "--image-prompt",
+        type=str,
+        default="",
+        help="sd15-custom only: positive prompt (default: empty, i.e. unconditional).",
+    )
+    sd15.add_argument(
+        "--image-negative-prompt",
+        type=str,
+        default="blurry, mosaic, pixelated, censored, low quality, watermark, text",
+        help="sd15-custom only: negative prompt (default: %(default)s)",
+    )
+    sd15.add_argument(
+        "--sd15-guidance",
+        type=float,
+        default=7.0,
+        help="sd15-custom only: classifier-free guidance scale (default: %(default)s)",
+    )
+    sd15.add_argument(
+        "--image-clip-size",
+        type=int,
+        default=IMAGE_CLIP_SIZE_DEFAULT,
+        help=(
+            "basicvsrpp image mode only: number of identical frames in the synthetic clip; the "
+            "middle one is kept. Larger values give the recurrent propagation more passes at a "
+            "proportional cost (default: %(default)s)"
+        ),
     )
     sd15.add_argument(
         "--sd15-steps",
@@ -550,6 +632,13 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+    # --images-only turns the secondary upscaler on by default: it is the still-image
+    # workflow, where the 256x256 restoration crop is the main source of softness.
+    # An explicit --secondary-restoration (including "none") always wins.
+    if args.secondary_restoration is None:
+        args.secondary_restoration = "rtx-super-res" if args.images_only else "none"
+        if args.images_only:
+            print("--images-only: applying --secondary-restoration rtx-super-res")
     codec_was_explicit = any(
         value == "--codec" or value.startswith("--codec=")
         for value in sys.argv[1:]
@@ -583,8 +672,16 @@ def main() -> None:
 
     if args.input is None and not is_streaming:
         parser.error("--input is required when not using --benchmark or --stream")
+    if bool(args.images_only) and args.input is not None and not Path(args.input).is_dir():
+        parser.error("--images-only applies to folder input")
     if args.output is None and not is_streaming:
-        parser.error("--output is required when not using --benchmark or --stream")
+        # Still images (and image folders) default to restoring in place, so they may
+        # omit --output; video may not, since it cannot read and write the same file.
+        from jasna.media.image_io import is_image_path as _is_image_path
+
+        _input = Path(args.input)
+        if not (_is_image_path(_input) or _input.is_dir()):
+            parser.error("--output is required when not using --benchmark or --stream")
 
     path_ok, path_info = check_ascii_install_path()
     if not path_ok:
@@ -636,11 +733,26 @@ def main() -> None:
     if input_video is not None and not input_video.exists():
         raise FileNotFoundError(str(input_video))
 
-    output_video = Path(args.output) if args.output else (input_video.with_stem(input_video.stem + "_out") if input_video else None)
-
     from jasna.media.image_io import is_image_path
     input_is_image = input_video is not None and is_image_path(input_video)
     input_is_dir = input_video is not None and input_video.is_dir()
+
+    # With no --output, still images are restored IN PLACE (the originals are
+    # overwritten) instead of gaining an "_out" twin. Video never defaults to
+    # in-place: the pipeline writes its output while still reading the input, so
+    # the same path would corrupt the source.
+    restore_in_place = args.output is None and (input_is_image or input_is_dir)
+    if args.output:
+        output_video = Path(args.output)
+    elif input_video is None:
+        output_video = None
+    elif restore_in_place:
+        output_video = input_video
+    else:
+        output_video = input_video.with_stem(input_video.stem + "_out")
+
+    if int(args.image_clip_size) <= 0:
+        parser.error("--image-clip-size must be >= 1")
     segments_spec = str(args.segments).strip()
     if segments_spec:
         if is_streaming:
@@ -658,12 +770,37 @@ def main() -> None:
         if is_streaming:
             parser.error("--stream does not support folder input")
         from jasna.media.media_files import classify_folder, folder_output_path, is_media
-        folder_images, folder_videos = classify_folder(input_video)
+        recursive = bool(args.recursive)
+        folder_images, folder_videos = classify_folder(input_video, recursive=recursive)
+        # Subfolders are mirrored under the output root, so same-named files in
+        # different subfolders do not collide (and in place means the same subfolder).
+        folder_root = input_video if recursive else None
+        skipped_videos = 0
+        if bool(args.images_only) and folder_videos:
+            skipped_videos = len(folder_videos)
+            folder_videos = []
+            print(f"--images-only: skipping {skipped_videos} video(s)")
         folder_total = len(folder_images) + len(folder_videos)
         if not folder_images and not folder_videos:
-            parser.error(f"No image or video files found in folder: {input_video}")
+            if skipped_videos:
+                parser.error(
+                    f"--images-only skipped all {skipped_videos} file(s): "
+                    f"no images in {input_video}"
+                )
+            hint = "" if recursive else " (use --recursive to include subfolders)"
+            parser.error(f"No image or video files found in folder: {input_video}{hint}")
         if output_video is None:
             parser.error("--output (a folder) is required when --input is a folder")
+        if restore_in_place and folder_videos:
+            parser.error(
+                f"{input_video} contains {len(folder_videos)} video(s), and only images can be "
+                "restored in place: pass --images-only to skip them, or --output to write "
+                "everything (images and videos) somewhere else"
+            )
+        # In place means "keep the filename" - unless an explicit pattern says otherwise.
+        folder_pattern = args.output_pattern
+        if restore_in_place and folder_pattern is None:
+            folder_pattern = "{original}"
         folder_output_dir = output_video
         if folder_output_dir.exists() and not folder_output_dir.is_dir():
             parser.error(f"--output must be a folder when --input is a folder (got existing file: {folder_output_dir})")
@@ -671,11 +808,22 @@ def main() -> None:
             parser.error(
                 f"--output must be a folder when --input is a folder; got a media filename: {folder_output_dir}"
             )
+        if recursive and not restore_in_place:
+            # An output folder inside the input tree would be swept up as input on the
+            # next run (the file list is snapshotted, so this run itself is safe).
+            try:
+                folder_output_dir.resolve().relative_to(input_video.resolve())
+            except ValueError:
+                pass
+            else:
+                parser.error(
+                    f"--output must not be inside --input when using --recursive: {folder_output_dir}"
+                )
         folder_inputs = [*folder_images, *folder_videos]
         planned_outputs: dict[str, tuple[Path, Path]] = {}
         input_keys = {_path_collision_key(path) for path in folder_inputs}
         for path in folder_inputs:
-            out_path = folder_output_path(folder_output_dir, path, args.output_pattern)
+            out_path = folder_output_path(folder_output_dir, path, folder_pattern, folder_root)
             out_key = _path_collision_key(out_path)
             if out_key in planned_outputs:
                 other_input, other_output = planned_outputs[out_key]
@@ -683,19 +831,25 @@ def main() -> None:
                     "--output-pattern maps multiple inputs to the same output: "
                     f"{other_input.name} and {path.name} -> {other_output}"
                 )
-            if out_key in input_keys:
+            # Overwriting an input is the whole point of the in-place default; it is
+            # still an error when the user asked for a separate output.
+            if out_key in input_keys and not restore_in_place:
                 parser.error(f"--output-pattern would overwrite an input file: {out_path}")
             planned_outputs[out_key] = (path, out_path)
         folder_output_dir.mkdir(parents=True, exist_ok=True)
         # Images first, then videos.
         if folder_images:
             from jasna.image_restore import run_image_restoration_folder
+            if restore_in_place:
+                print(f"No --output given: overwriting {len(folder_images)} image(s) in {folder_output_dir}"
+                      + (" and its subfolders" if recursive else ""))
             run_image_restoration_folder(
                 args,
                 folder_images,
                 folder_output_dir,
-                output_pattern=args.output_pattern,
+                output_pattern=folder_pattern,
                 progress_total=folder_total,
+                input_root=folder_root,
             )
         if not folder_videos:
             _run_post_export_action()
@@ -872,7 +1026,7 @@ def main() -> None:
 
         def _video_output_path(vid: Path) -> Path:
             if input_is_dir:
-                return folder_output_path(folder_output_dir, vid, args.output_pattern)
+                return folder_output_path(folder_output_dir, vid, args.output_pattern, folder_root)
             return output_video or vid.with_stem(vid.stem + "_out")
 
         pipeline: Pipeline | None = None

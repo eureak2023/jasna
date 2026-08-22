@@ -9,6 +9,24 @@ from jasna.gui.sd15_download_worker import start_sd15_download
 from jasna.gui.settings_sections.widgets import create_slider_value_label, get_tooltip
 from jasna.gui.theme import Colors, Fonts, Sizing
 
+# Registry name -> dropdown label. Values are what the option menu shows; the
+# settings model stores the registry name.
+_ENGINE_LABELS = {
+    "sd-15-jav": "SD 1.5 (sd-15-jav)",
+    "basicvsrpp": "Video model (BasicVSR++)",
+}
+_ENGINE_NAMES = {label: name for name, label in _ENGINE_LABELS.items()}
+
+# Widgets that only apply to the SD 1.5 engine.
+_SD15_ONLY = (
+    "image_restore_steps",
+    "image_restore_strength",
+    "image_restore_variants",
+    "image_restore_seed",
+    "image_restore_freeu",
+    "image_restore_interactive_btn",
+)
+
 
 class ImageRestorationSection:
     def __init__(self, parent, widgets: dict, on_modified, show_toast, on_interactive):
@@ -30,6 +48,45 @@ class ImageRestorationSection:
             font=(Fonts.FAMILY, Fonts.SIZE_TINY), wraplength=320, justify="left",
         )
         info.pack(fill="x", pady=(0, Sizing.PADDING_SMALL))
+
+        # Engine picker. "basicvsrpp" reuses the video restoration weights, so it
+        # needs neither the 6.9 GB SD 1.5 download nor a licence; the SD 1.5 rows
+        # below are greyed out while it is selected.
+        row_engine = ctk.CTkFrame(inner, fg_color="transparent")
+        row_engine.pack(fill="x", pady=(0, Sizing.PADDING_SMALL))
+        engine_label = ctk.CTkLabel(row_engine, text=t("image_restore_engine"), text_color=Colors.TEXT_PRIMARY, font=(Fonts.FAMILY, Fonts.SIZE_NORMAL))
+        engine_label.pack(side="left")
+        engine_tip = ctk.CTkLabel(row_engine, text="ⓘ", text_color=Colors.TEXT_PRIMARY, font=(Fonts.FAMILY, Fonts.SIZE_TINY), cursor="hand2")
+        engine_tip.pack(side="left", padx=4)
+        Tooltip(engine_tip, get_tooltip("image_restore_engine"))
+        self._widgets["image_restore_model"] = ctk.CTkOptionMenu(
+            row_engine, values=list(_ENGINE_LABELS.values()), width=180,
+            fg_color=Colors.BG_CARD, button_color=Colors.BG_CARD, button_hover_color=Colors.BORDER_LIGHT,
+            text_color=Colors.TEXT_PRIMARY,
+            command=lambda _v: self._on_engine_change(),
+        )
+        self._widgets["image_restore_model"].pack(side="right")
+        self._widgets["image_restore_model"].set(_ENGINE_LABELS["basicvsrpp"])
+
+        # Clip size slider (1-15, step 1) — basicvsrpp only
+        row_clip = ctk.CTkFrame(inner, fg_color="transparent")
+        row_clip.pack(fill="x", pady=(0, Sizing.PADDING_SMALL))
+        clip_label = ctk.CTkLabel(row_clip, text=t("image_restore_clip_size"), text_color=Colors.TEXT_PRIMARY, font=(Fonts.FAMILY, Fonts.SIZE_NORMAL))
+        clip_label.pack(side="left")
+        clip_tip = ctk.CTkLabel(row_clip, text="ⓘ", text_color=Colors.TEXT_PRIMARY, font=(Fonts.FAMILY, Fonts.SIZE_TINY), cursor="hand2")
+        clip_tip.pack(side="left", padx=4)
+        Tooltip(clip_tip, get_tooltip("image_restore_clip_size"))
+        self._widgets["image_restore_clip_size_val"] = create_slider_value_label(
+            row_clip, "5", 4, Colors.BG_PANEL
+        )
+        self._widgets["image_restore_clip_size_val"].pack(side="right")
+        self._widgets["image_restore_clip_size"] = ctk.CTkSlider(
+            row_clip, from_=1, to=15, number_of_steps=14,
+            fg_color=Colors.BG_CARD, progress_color=Colors.PRIMARY, button_color=Colors.PRIMARY,
+            width=180, command=lambda v: self._on_slider_change("image_restore_clip_size", int(v)),
+        )
+        self._widgets["image_restore_clip_size"].pack(side="right", padx=(0, 8))
+        self._widgets["image_restore_clip_size"].set(5)
 
         # Model download (fixed location: model_weights/sd-15-jav)
         row_dl = ctk.CTkFrame(inner, fg_color="transparent")
@@ -148,10 +205,26 @@ class ImageRestorationSection:
         self._widgets["image_restore_freeu"].select()
 
         self._refresh_sd15_download_state()
+        self._refresh_engine_state()
 
     def _on_slider_change(self, key: str, value: int):
         self._widgets[f"{key}_val"].configure(text=str(value))
         self._on_modified()
+
+    def _selected_engine(self) -> str:
+        return _ENGINE_NAMES.get(self._widgets["image_restore_model"].get(), "basicvsrpp")
+
+    def _on_engine_change(self):
+        self._refresh_engine_state()
+        self._on_modified()
+
+    def _refresh_engine_state(self):
+        """Grey out the rows that do not apply to the selected engine."""
+        video = self._selected_engine() == "basicvsrpp"
+        for key in _SD15_ONLY:
+            self._widgets[key].configure(state="disabled" if video else "normal")
+        self._widgets["image_restore_clip_size"].configure(state="normal" if video else "disabled")
+        self._refresh_sd15_download_state()
 
     def _refresh_sd15_download_state(self):
         """Grey out the download button when the model is already installed."""
@@ -159,7 +232,10 @@ class ImageRestorationSection:
         from jasna.restorer.sd15_download import bundle_present
 
         btn = self._widgets["image_restore_download_btn"]
-        if bundle_present(SD15_DIR):
+        if self._selected_engine() == "basicvsrpp":
+            # Nothing to download: the video weights ship with Jasna.
+            btn.configure(state="disabled", text=t("image_restore_not_needed"))
+        elif bundle_present(SD15_DIR):
             btn.configure(state="disabled", text=t("image_restore_installed"))
         else:
             btn.configure(state="normal", text=t("image_restore_download"))
@@ -203,6 +279,11 @@ class ImageRestorationSection:
             self._refresh_sd15_download_state()
 
     def apply(self, preset):
+        self._widgets["image_restore_model"].set(
+            _ENGINE_LABELS.get(str(preset.image_restore_model), _ENGINE_LABELS["basicvsrpp"])
+        )
+        self._widgets["image_restore_clip_size"].set(preset.image_restore_clip_size)
+        self._widgets["image_restore_clip_size_val"].configure(text=str(preset.image_restore_clip_size))
         self._widgets["image_restore_steps"].set(preset.image_restore_steps)
         self._widgets["image_restore_steps_val"].configure(text=str(preset.image_restore_steps))
         self._widgets["image_restore_strength"].set(preset.image_restore_strength)
@@ -215,6 +296,7 @@ class ImageRestorationSection:
             self._widgets["image_restore_freeu"].select()
         else:
             self._widgets["image_restore_freeu"].deselect()
+        self._refresh_engine_state()
 
     def collect(self) -> dict:
         try:
@@ -222,6 +304,8 @@ class ImageRestorationSection:
         except ValueError:
             image_restore_seed = 0
         return {
+            "image_restore_model": self._selected_engine(),
+            "image_restore_clip_size": int(self._widgets["image_restore_clip_size"].get()),
             "image_restore_steps": int(self._widgets["image_restore_steps"].get()),
             "image_restore_strength": round(float(self._widgets["image_restore_strength"].get()), 2),
             "image_restore_freeu": self._widgets["image_restore_freeu"].get() == 1,

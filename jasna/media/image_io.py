@@ -43,4 +43,8 @@ def write_image_rgb_chw(path: str | Path, chw_uint8: np.ndarray) -> None:
     ok, buf = cv2.imencode(path.suffix, bgr)
     if not ok:
         raise ValueError(f"Failed to encode image for suffix {path.suffix!r}: {path}")
+    # Recursive folder batches mirror the input's subfolders, which may not exist
+    # under the output root yet.
+    if path.parent and not path.parent.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
     buf.tofile(str(path))

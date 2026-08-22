@@ -6,11 +6,20 @@ Jasna's CLI mirrors the GUI. `jasna --help` always shows the full, current list 
 # Single video
 jasna --input input.mp4 --output output.mkv
 
-# Still image (routes to SD 1.5 automatically)
+# Still image (routes to the still-image path automatically)
 jasna --input photo.png --output restored.png
+
+# ...or with no --output: restore the image in place
+jasna --input photo.png
 
 # Whole folder (images first, then videos)
 jasna --input input_folder --output output_folder
+
+# ...including every subfolder, restored in place
+jasna --input input_folder --recursive
+
+# Mixed folder: restore the images in place, skip the videos
+jasna --input input_folder --recursive --images-only
 ```
 
 On Windows the CLI is the same file as the app: `jasna.exe --input ...`.
@@ -21,8 +30,10 @@ On Windows the CLI is the same file as the app: `jasna.exe --input ...`.
 | ------ | ------- | ----- |
 | `--version` | — | Print the Jasna version and exit. |
 | `--input` | — | Video, image, or folder. |
-| `--output` | — | Output file, or output folder when `--input` is a folder. |
-| `--output-pattern` | `{original}_out` | Filename template for folder input. `{original}` is the input stem. Images keep their source extension; videos use the template extension when provided. Jasna checks planned outputs before processing and errors out if two inputs map to the same file. |
+| `--output` | in place for images | Output file, or output folder when `--input` is a folder. Omit it and still images are restored **in place** (the originals are overwritten); an image folder is likewise restored in place. Video always needs an explicit `--output` — the pipeline writes while reading the input. |
+| `--images-only` | off | Folder input: process the images and skip every video. Lets a mixed folder be restored in place (video cannot be, since it is read while being written). Also turns on `--secondary-restoration rtx-super-res`; pass `--secondary-restoration none` to opt out. |
+| `--recursive` / `-r` | off | Folder input: also process subfolders, at any depth. Each output keeps its subfolder, mirrored under `--output`, so same-named files in different subfolders never collide. With `--recursive`, `--output` may not be inside `--input`. |
+| `--output-pattern` | `{original}_out`, or `{original}` in place | Filename template for folder input. `{original}` is the input stem. Images keep their source extension; videos use the template extension when provided. Jasna checks planned outputs before processing and errors out if two inputs map to the same file. |
 | `--device` | `cuda:0` | GPU selection. AMD cards use the same `cuda:N` names through ROCm. |
 | `--batch-size` | `4` | Detection batch size. Legacy `rfdetr-v5` always uses 4. |
 | `--fp16` / `--no-fp16` | on | FP16 where supported (restoration + TensorRT). Lowers VRAM, may improve speed. |
@@ -57,7 +68,7 @@ On Windows the CLI is the same file as the app: `jasna.exe --input ...`.
 
 | Option | Default | Notes |
 | ------ | ------- | ----- |
-| `--secondary-restoration` | `none` | `unet-4x`, `tvai`, or `rtx-super-res`. See [Models](models.md). |
+| `--secondary-restoration` | `none`, or `rtx-super-res` with `--images-only` | `unet-4x`, `tvai`, or `rtx-super-res`. See [Models](models.md). An explicit value always wins over the `--images-only` default. |
 | `--rtx-scale` | `4` | RTX Super Res upscale factor (`2` or `4`). |
 | `--rtx-quality` | `high` | `low`–`ultra`. |
 | `--rtx-denoise` | `medium` | `none` disables. |
@@ -69,13 +80,34 @@ On Windows the CLI is the same file as the app: `jasna.exe --input ...`.
 | `--tvai-workers` | `2` | Parallel TVAI ffmpeg workers. |
 | `--tvai-denoise` | off | Apply TVAI Denoise before enhancement. |
 
-## SD 1.5 image restoration
+## Still image restoration
 
 Still images route here automatically; `--restoration-model-name` is video-only.
 
 | Option | Default | Notes |
 | ------ | ------- | ----- |
-| `--image-restoration-model-name` | `sd-15-jav` | Only current value. |
+| `--image-restoration-model-name` | `basicvsrpp` | `basicvsrpp` reuses the video restoration weights from `--restoration-model-path` — nothing extra to download. `sd-15-jav` inpaints with the fine-tuned SD 1.5 model instead (separate 6.9 GB download, supporter licence). |
+| `--image-clip-size` | `5` | `basicvsrpp` only: frames in the synthetic clip; the middle one is kept. |
+
+### Video model (`basicvsrpp`)
+
+```bash
+jasna --input photo.png --output restored.png
+```
+
+Runs the same BasicVSR++ restorer the video pipeline uses, on a clip made of N
+identical copies of the image. Uses the weights already in `model_weights/`, so
+there is no download and no licence. `--denoise` applies here too; the
+`--sd15-*` options do not.
+
+A single frame carries no extra information to fuse, so this cannot match what
+the model does on real video — but it keeps the source pixels rather than
+inventing new ones, and it is far faster than diffusion.
+
+### SD 1.5 (`sd-15-jav`)
+
+| Option | Default | Notes |
+| ------ | ------- | ----- |
 | `--sd15-steps` | `25` | Diffusion steps. |
 | `--sd15-strength` | `0.6` | SDEdit denoise strength, clamped to `<= 0.7`. |
 | `--sd15-freeu` / `--no-sd15-freeu` | on | FreeU UNet tweak. |

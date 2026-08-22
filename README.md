@@ -25,7 +25,7 @@ Jasna is free. Supporters get a key that unlocks the extra models trained for th
 ## What Jasna Does
 
 - Restores mosaics in video files.
-- Restores mosaics in still images with the experimental SD 1.5 image model.
+- Restores mosaics in still images, either with the video restoration model (nothing extra to install) or with the experimental SD 1.5 image model.
 - Detects mosaics with the fast `rfdetr-v6` model by default; the larger RF-DETR variant and Lada and ZeLeFans YOLO models are also available.
 - Processes side-by-side VR180 videos per eye and automatically picks the best mosaic restoration handling for each studio; the Segment Editor can preview the options.
 - Supports frame-accurate ranges on NVIDIA and AMD GPUs, restoration previews, and zoom/pan inspection in the Segment Editor.
