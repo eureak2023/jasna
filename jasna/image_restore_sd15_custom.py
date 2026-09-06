@@ -258,6 +258,11 @@ def run_image_jobs_sd15_custom(args, jobs: list[tuple[Path, Path]], progress_cal
     )
 
     num_variants = max(1, int(args.sd15_variants))
+    print(
+        f"image engine: SD 1.5 inpainting ({Path(model_path).name}, "
+        f"steps {int(args.sd15_steps)}, strength {float(args.sd15_strength)}, "
+        f"variants {num_variants})"
+    )
     try:
         for i, (input_path, output_base) in enumerate(jobs, start=1):
             if progress_callback is not None:
@@ -265,6 +270,11 @@ def run_image_jobs_sd15_custom(args, jobs: list[tuple[Path, Path]], progress_cal
             img = image_io.read_image_rgb_chw(input_path)
             with torch.cuda.device(device) if device.type == "cuda" else nullcontext():
                 prepared = prepare_image_restore(img, detector, device=device, fp16=fp16)
+                if not prepared.groups:
+                    print("      no mosaic detected - written unchanged")
+                else:
+                    print(f"      {len(prepared.groups)} mosaic group(s) inpainted"
+                          + (f" x{num_variants} variants" if num_variants > 1 else ""))
                 outputs = [
                     restore_prepared_sd15(
                         prepared, pipe,

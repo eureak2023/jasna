@@ -54,11 +54,15 @@ def restore_image_video_model(
     clip_size: int = DEFAULT_IMAGE_CLIP_SIZE,
     denoise_strength: DenoiseStrength = DenoiseStrength.NONE,
     secondary_restorer=None,
+    stats: dict | None = None,
 ) -> np.ndarray:
     """Detect mosaics, restore each one with BasicVSR++, composite back.
 
     Returns a ``(3, H, W)`` uint8 RGB array. Zero detections -> a copy of the
     input unchanged (same contract as ``image_restore.restore_image``).
+
+    ``stats``, when given, is filled with ``regions`` and ``secondary`` counts so
+    the caller can report per-image results without turning on info logging.
     """
     frame_cpu = torch.from_numpy(img_chw_u8)
     _, frame_h, frame_w = img_chw_u8.shape
@@ -73,6 +77,8 @@ def restore_image_video_model(
 
     if len(boxes) == 0:
         logger.info("No mosaics detected; writing input unchanged")
+        if stats is not None:
+            stats.update(regions=0, secondary=0)
         return img_chw_u8.copy()
 
     clip_size = max(1, int(clip_size))
@@ -147,6 +153,8 @@ def restore_image_video_model(
         )
     else:
         logger.info("Restored %d mosaic region(s) with the video model", len(boxes))
+    if stats is not None:
+        stats.update(regions=int(len(boxes)), secondary=int(secondary_used))
     return np.ascontiguousarray(blended.cpu().numpy())
 
 
@@ -247,12 +255,19 @@ def run_image_jobs_video_model(args, jobs: list[tuple[Path, Path]], progress_cal
         ),
         device,
     )
+    banner = f"image engine: BasicVSR++ (clip {clip_size}"
+    if secondary_restorer is not None:
+        banner += f", secondary {secondary_restorer.name} for regions > {RESTORATION_SIZE}px"
+    if denoise_strength is not DenoiseStrength.NONE:
+        banner += f", denoise {denoise_strength.value}"
+    print(banner + ")")
     try:
         for i, (input_path, output_path) in enumerate(jobs, start=1):
             logger.info("[%d/%d] Processing %s", i, len(jobs), input_path.name)
             if progress_callback is not None:
                 progress_callback(i, input_path, output_path)
             img = image_io.read_image_rgb_chw(input_path)
+            stats: dict = {}
             with torch.cuda.device(device) if device.type == "cuda" else nullcontext():
                 out = restore_image_video_model(
                     img, detector, restorer,
@@ -260,8 +275,17 @@ def run_image_jobs_video_model(args, jobs: list[tuple[Path, Path]], progress_cal
                     clip_size=clip_size,
                     denoise_strength=denoise_strength,
                     secondary_restorer=secondary_restorer,
+                    stats=stats,
                 )
             image_io.write_image_rgb_chw(output_path, out)
+            regions = stats.get("regions", 0)
+            if not regions:
+                print("      no mosaic detected - written unchanged")
+            else:
+                extra = ""
+                if secondary_restorer is not None:
+                    extra = f", {stats.get('secondary', 0)} upscaled by {secondary_restorer.name}"
+                print(f"      {regions} mosaic region(s) restored{extra}")
             logger.info("Wrote %s", output_path)
     finally:
         detector.close()

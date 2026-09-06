@@ -286,13 +286,39 @@ def _run_image_jobs(args, jobs: list[tuple[Path, Path]], progress_callback=None)
         run_image_jobs_video_model(args, jobs, progress_callback=progress_callback)
         return
     if engine == "sd15-custom":
-        from jasna.image_restore_sd15_custom import run_image_jobs_sd15_custom
+        try:
+            from jasna.image_restore_sd15_custom import run_image_jobs_sd15_custom
+        except ImportError as exc:
+            raise RuntimeError(
+                "--image-restoration-model-name sd15-custom needs diffusers, which this "
+                f"build does not ship ({exc}). Run it from the jasna source checkout, or "
+                "use basicvsrpp."
+            ) from exc
 
         run_image_jobs_sd15_custom(args, jobs, progress_callback=progress_callback)
         return
 
     from jasna.engine_compiler import EngineCompilationRequest, ensure_engines_compiled
     from jasna.engine_paths import SD15_DIR
+
+    # sd-15-jav ships encrypted and is decrypted by jasna.protection, which is not
+    # part of the public source tree. Say so here instead of offering a 6.9 GB
+    # download that could never be decrypted afterwards.
+    from jasna.restorer.sd15_inpaint_restorer import use_plaintext_sd15
+
+    if not use_plaintext_sd15(SD15_DIR):
+        try:
+            # An empty jasna/protection/ directory still resolves as a namespace
+            # package, so importlib.util.find_spec is not enough - import the module
+            # that actually does the decryption.
+            from jasna.protection import protected_model  # noqa: F401
+        except ImportError:
+            raise RuntimeError(
+                "sd-15-jav is unavailable in this build: it is an encrypted supporter "
+                "model and jasna.protection (the module that decrypts it) is not in the "
+                "public source tree. Use --image-restoration-model-name basicvsrpp, or "
+                "sd15-custom with your own SD 1.5 inpainting checkpoint."
+            ) from None
     from jasna.media import image_io
     from jasna.mosaic.detection_registry import (
         build_detection_model,
