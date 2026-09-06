@@ -34,6 +34,7 @@ from jasna.media.splice import (
 from jasna.mosaic.detection_registry import build_detection_model
 from jasna.pipeline_debug_logging import PipelineDebugMemoryLogger
 from jasna.pipeline_items import FrameMeta, PrimaryRestoreResult, SecondaryLoopStats, _SENTINEL
+from jasna import dlss_nr
 from jasna.pipeline_threads import decode_detect_loop, primary_restore_loop, secondary_restore_loop, blend_encode_loop
 from jasna.progressbar import Progressbar
 from jasna.restorer import RestorationPipeline
@@ -103,6 +104,8 @@ class Pipeline:
         segments: tuple[SegmentRange, ...] | None = None,
         splice_plan: SplicePlan | None = None,
         working_dir: Path | None = None,
+        dlss_nr_strength: int = 0,
+        dlss_nr_colour: float = 0.0,
     ) -> None:
         self.input_video = input_video
         self.output_video = output_video
@@ -137,6 +140,10 @@ class Pipeline:
         self.fmp4 = bool(fmp4)
         self.segments = tuple(segments) if segments else None
         self.splice_plan = splice_plan
+        # Optional finishing pass; None whenever the GPU, the driver or the
+        # DLLs cannot supply it, which is not an error.
+        self.dlss_nr = (dlss_nr.load(int(dlss_nr_strength), float(dlss_nr_colour))
+                        if dlss_nr_strength else None)
         self._vr_resolution = None
         self._vr_projector = None
         self._job_detection_model = self.detection_model
@@ -179,6 +186,9 @@ class Pipeline:
             if hasattr(self.detection_model, "close"):
                 self.detection_model.close()
             self.detection_model = None
+        if getattr(self, "dlss_nr", None) is not None:
+            self.dlss_nr.close()
+            self.dlss_nr = None
         self.restoration_pipeline = None
 
     _ASYNC_POLL_TIMEOUT = 0.05
@@ -482,6 +492,7 @@ class Pipeline:
                     frame_stride=frame_rate.frame_stride,
                     seek_ts=seek_ts,
                     cancel_event=self._cancel_event,
+                    dlss_nr=self.dlss_nr,
                 ),
                 name="BlendEncode", daemon=True,
             ),

@@ -287,6 +287,7 @@ def _run_streaming_pass(
                 cancel_event=cancel_event,
                 seek_ts=seek_ts,
                 vram_offloader=vram_offloader,
+                dlss_nr=getattr(pipeline, "dlss_nr", None),
             ),
             name="StreamBlendEncode", daemon=True,
         ),

@@ -356,6 +356,7 @@ def blend_encode_loop(
     seek_ts: float | None = None,
     frame_stride: int = 1,
     vram_offloader=None,
+    dlss_nr=None,
 ) -> None:
     timer = LoopTimer("blend-encode")
     try:
@@ -430,6 +431,12 @@ def blend_encode_loop(
                             meta.frame_idx,
                             original_frame,
                         )
+                if dlss_nr is not None:
+                    # After the blend, so the model works on the finished
+                    # picture; the detector and the restorer never see it.
+                    with timer.measure("dlss-nr"):
+                        blended = dlss_nr.process(blended)
+
                 with timer.measure("write"):
                     if meta.apply_effect:
                         frame_writer.write(blended, meta.pts)

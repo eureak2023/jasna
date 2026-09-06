@@ -173,6 +173,8 @@ def build_pipeline(
         progress_callback=progress_callback,
         lut_path=config.lut_path,
         sharpen_strength=config.sharpen_strength,
+        dlss_nr_strength=int(getattr(config, "dlss_nr_strength", 0)),
+        dlss_nr_colour=float(getattr(config, "dlss_nr_colour", 0.0)),
         retarget_high_fps=bool(config.retarget_high_fps),
         fmp4=bool(config.fmp4),
         segments=segments,

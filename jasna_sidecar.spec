@@ -29,6 +29,23 @@ for _exe in ('ffmpeg.exe', 'ffprobe.exe'):
     if _os.path.isfile(_p):
         datas += [(_p, 'tools')]
 
+# DLSS 5 neural rendering (--dlss-nr). Two loose DLLs built by
+# native/dlssnr/build.sh: the D3D12 host ctypes calls, and the NGX forwarder it
+# loads from the same directory - whose name is load-bearing, because the
+# snippet refuses callers whose module path lacks "nvngx.dll". Both go to the
+# bundle ROOT alongside the exe (see the root copies at the bottom); the 158 MB
+# nvngx_dlssnr.dll itself is NOT shipped, it is found in bin\ at runtime.
+_NGX = _os.path.join(_os.path.dirname(_os.path.abspath(SPEC)), 'native', 'dlssnr')
+_NGX_DLLS = []
+for _dll in ('jasna_dlssnr.dll', 'nvngx.dll_jasna.dll'):
+    _p = _os.path.join(_NGX, _dll)
+    if _os.path.isfile(_p):
+        datas += [(_p, '.')]
+        _NGX_DLLS.append(_p)
+    else:
+        print(f'spec: WARNING {_dll} missing - build it with native/dlssnr/build.sh; '
+              '--dlss-nr will be unavailable in this bundle')
+
 hiddenimports += collect_submodules('mmengine')
 hiddenimports += collect_submodules('jasna')
 
@@ -40,11 +57,28 @@ hiddenimports += collect_submodules('jasna')
 # with "Cannot find nvCVImage DLL or its dependencies". _lib_loader resolves them
 # as Path(__file__).parent/"libs", which collect_all maps correctly under
 # _internal, so no bundle-root copy is needed (unlike the fatbins above).
+# diffusers/transformers/peft power --image-restoration-model-name sd15-custom
+# (any SD 1.5 inpainting checkpoint). huggingface_hub + requests come with them:
+# from_single_file resolves the pipeline's component configs from the Hub.
 for pkg in ('torch', 'torchvision', 'ultralytics', 'cv2', 'av', 'jasna',
             'tensorrt', 'tensorrt_libs', 'tensorrt_bindings', 'torch_tensorrt',
-            'onnxruntime', 'customtkinter', 'tkinterdnd2', 'nvvfx'):
+            'onnxruntime', 'customtkinter', 'tkinterdnd2', 'nvvfx',
+            'diffusers', 'transformers', 'peft', 'huggingface_hub', 'requests'):
     d, b, h = collect_all(pkg)
     datas += d; binaries += b; hiddenimports += h
+
+# diffusers and friends look their dependencies up through importlib.metadata at
+# import time, which needs the *.dist-info directories, not just the modules.
+# Without this the frozen exe dies with "No package metadata was found for
+# requests" the moment an SD engine is selected.
+from PyInstaller.utils.hooks import copy_metadata
+for _meta in ('diffusers', 'transformers', 'peft', 'huggingface_hub', 'requests',
+              'safetensors', 'tokenizers', 'numpy', 'torch', 'torchvision', 'tqdm',
+              'filelock', 'packaging', 'regex', 'pyyaml', 'accelerate', 'pillow'):
+    try:
+        datas += copy_metadata(_meta)
+    except Exception:
+        pass  # optional dependency, not installed - nothing to copy
 
 a = Analysis(
     [r'D:\Source_AI\ffplay-fsr1\jasna\jasna_sidecar.py'],
@@ -96,3 +130,9 @@ _root = _os.path.join(DISTPATH, 'jasna_sidecar')
 for _f in _FATBINS:
     _shutil.copy2(_f, _os.path.join(_root, _os.path.basename(_f)))
 print(f"spec: copied {len(_FATBINS)} fatbin(s) to the bundle root {_root}")
+
+# Same reason for the DLSS pair: dlss_nr.py looks beside sys.executable first, and the
+# forwarder has to sit in the same directory as the host that LoadLibrary()s it.
+for _f in _NGX_DLLS:
+    _shutil.copy2(_f, _os.path.join(_root, _os.path.basename(_f)))
+print(f"spec: copied {len(_NGX_DLLS)} DLSS DLL(s) to the bundle root {_root}")

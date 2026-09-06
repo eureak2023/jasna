@@ -59,4 +59,7 @@ class SessionConfig:
     vr_projection: VrProjectionName = "auto"
     fmp4: bool = False
     sharpen_strength: float = 0.0
+    # DLSS 5 neural rendering, percent; 0 = off (see jasna/dlss_nr.py)
+    dlss_nr_strength: int = 0
+    dlss_nr_colour: float = 0.0
     tvai_denoise: bool = False

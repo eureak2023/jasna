@@ -70,6 +70,8 @@ def _session_config_from_args(
         encoder_settings=encoder_settings,
         lut_path=lut_path,
         sharpen_strength=float(args.sharpen),
+        dlss_nr_strength=int(args.dlss_nr),
+        dlss_nr_colour=float(args.dlss_nr_colour),
         retarget_high_fps=bool(args.retarget_high_fps),
         fmp4=bool(args.fmp4),
         disable_progress=bool(args.no_progress),
@@ -562,6 +564,31 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Sharpen the picture on GPU before encoding, from 0 (off) to 1 "
             "(strongest). Matches the ffmpeg cas filter."
+        ),
+    )
+    encoding.add_argument(
+        "--dlss-nr",
+        type=int,
+        default=0,
+        metavar="PERCENT",
+        help=(
+            "DLSS 5 neural rendering: resynthesise fine detail a low-bitrate "
+            "encode threw away, as a finishing pass after mosaic restoration "
+            "(0 = off, 60 is a good starting point, above ~100 the synthesised "
+            "grain shows; max 150). Needs an RTX 50 series GPU and "
+            "nvngx_dlssnr.dll beside the sidecar; silently off without them."
+        ),
+    )
+    encoding.add_argument(
+        "--dlss-nr-colour",
+        type=float,
+        default=0.0,
+        metavar="AMOUNT",
+        help=(
+            "How much of the model's own colour to let through, 0 to 1. At 0 "
+            "(default) only its brightness verdict is taken and the source hue "
+            "is untouched, which is what keeps the pass from tinting the "
+            "picture. Ignored unless --dlss-nr is on."
         ),
     )
     encoding.add_argument(

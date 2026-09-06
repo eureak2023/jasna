@@ -1,0 +1,5 @@
+# Build products of build.sh. Both are reproduced from the sources beside them
+# by an mingw64 gcc in a few seconds, and the bundle picks them up from here at
+# PyInstaller time (see jasna_sidecar.spec), so there is nothing to gain from
+# tracking ~570 KB of binary.
+*.dll
